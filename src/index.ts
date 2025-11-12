@@ -3,7 +3,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { parse } from 'csv-parse/browser/esm/sync';
 
 /**
- * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v7 - AI 規則更新)
+ * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v9 - 使用 gemini-2.5-flash)
  *
  * 環境變數 (來自 wrangler.toml 和 Cloudflare Secrets):
  * - env.DB: 我們的 D1 資料庫 (geminilink_db)
@@ -39,8 +39,11 @@ export default {
 
 			// 1. 初始化服務 (從 env 取得)
 			const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-			const model = genAI.getGenerativeModel({ model: 'gemini-pro' }); // 使用 v5 的 'gemini-pro'
-			const DB = env.DB;
+			
+            // *** 修正 v9：使用您指定的 'gemini-2.5-flash' 模型 ***
+			const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' }); 
+			
+            const DB = env.DB;
 			const R2_BUCKET = env.FILES;
 
 			// 2. 取得批次編號 (例如 ?batch=1)
@@ -82,7 +85,6 @@ export default {
 				if (!sku) continue; // 跳過空行
 
 				// 5a. 呼叫 AI 產生「主要客群」
-				// *** v7 修正：呼叫包含您最新規則的 Prompt ***
 				const prompt = getAudiencePrompt_v7(row);
 				let audienceTags: string[] = ['other']; // 預設值 (英文)
 				try {
@@ -198,7 +200,7 @@ function parseImageUrls(cellContent: string): string[] {
 }
 
 /**
- * 【新】輔助函式：從 URL 下載圖片並上傳到 R2
+ * 【新】輔D助函式：從 URL 下載圖片並上傳到 R2
  */
 async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket) {
 	try {
