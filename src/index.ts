@@ -1,17 +1,19 @@
 /*
  * 檔案: src/index.ts
- * 版本: V12 (Hono 路由 + 認證)
+ * 版本: V13 (Hono + 即時監控 UI)
  * 備註: 這是您的核心後端 API 伺服器。
- * - 使用 Hono 進行路由管理。
- * - 新增 /api/auth/register 和 /api/auth/login API。
- * - 保留 v11 的全自動批次匯入功能。
- * - 修正了所有 CSV 解析、Gemini 模型名稱 (gemini-2.5-flash) 和 D1 綁定問題。
+ * - 移除了 v12 失敗的 "全自動" 背景迴圈 (ctx.waitUntil)。
+ * - 恢復 v9 的 `GET /api/admin/batch-import` API，它會處理一個批次並 "回傳 JSON 報告"。
+ * - 新增 `GET /admin/importer` API，它會回傳一個 "HTML 頁面"。
+ * - 這個 HTML 頁面上的 JavaScript 將在 "使用者瀏覽器" 中執行迴圈，
+ * 提供即時、可監控的匯入進度。
  */
 
 import { Hono } from 'hono';
+import { html } from 'hono/html'; // v13 新增：用於回傳 HTML 頁面
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { parse } from 'csv-parse/browser/esm/sync'; // v3 修正版
-import * as bcrypt from 'bcryptjs'; // v12 新增
+import * as bcrypt from 'bcryptjs';
 
 /**
  * 環境變數 (來自 wrangler.toml 和 Cloudflare Secrets)
@@ -20,13 +22,13 @@ export interface Env {
 	DB: D1Database;
 	FILES: R2Bucket;
 	GEMINI_API_KEY: string;
-	REGISTRATION_KEY: string; // v12 新增：用於保護註冊 API
+	REGISTRATION_KEY: string;
 }
 
 // --- 設定 ---
 const BATCH_SIZE = 3; // 每個批次處理 3 筆 (因為圖片處理耗時)
 const CSV_FILE_NAME = 'product_inventory_master_v2.csv'; // R2 上的 CSV 檔案
-const BCRYPT_SALT_ROUNDS = 10; // 密碼加密強度
+const BCRYPT_SALT_ROUNDS = 10;
 
 // ===========================================
 // === 1. 初始化 Hono App (您的 API 路由器) ===
@@ -34,13 +36,12 @@ const BCRYPT_SALT_ROUNDS = 10; // 密碼加密強度
 const app = new Hono<{ Bindings: Env }>();
 
 // ===========================================
-// === 2. API 路由 (v12 新增：認證) ===
+// === 2. API 路由 (v12 保留：認證) ===
 // ===========================================
 
 /**
  * POST /api/auth/register
  * 註冊您的第一個 admin 帳號。
- * 需要正確的 REGISTRATION_KEY 才能成功。
  */
 app.post('/api/auth/register', async (c) => {
 	const body = await c.req.json();
@@ -52,24 +53,21 @@ app.post('/api/auth/register', async (c) => {
 
 	// 驗證 Registration Key
 	if (key !== c.env.REGISTRATION_KEY) {
-		return c.json({ error: '無效的註冊安全碼' }, 403); // 403 Forbidden
+		return c.json({ error: '無效的註冊安全碼' }, 403);
 	}
 
-	// 檢查帳號是否已存在
 	try {
 		const existingUser = await c.env.DB.prepare('SELECT user_id FROM Users WHERE email = ?').bind(email).first();
 		if (existingUser) {
-			return c.json({ error: '此 email 已被註冊' }, 409); // 409 Conflict
+			return c.json({ error: '此 email 已被註冊' }, 409);
 		}
-
-		// 將密碼加密
 		const passwordHash = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
-
-		// 寫入 D1 資料庫 (建立為 admin)
 		await c.env.DB.prepare(
 			`INSERT INTO Users (email, password_hash, role, supplier_id) 
-       VALUES (?, ?, 'admin', NULL)`, // Admin 帳號不綁定特定供應商
-		).bind(email, passwordHash).run();
+       VALUES (?, ?, 'admin', NULL)`,
+		)
+			.bind(email, passwordHash)
+			.run();
 
 		return c.json({ message: 'Admin 帳號建立成功' });
 	} catch (e: any) {
@@ -80,7 +78,6 @@ app.post('/api/auth/register', async (c) => {
 /**
  * POST /api/auth/login
  * 登入以取得權限 (未來用於前端介面)
- * (注意：一個完整的系統會回傳 JWT (Token)，目前我們先回傳成功訊息)
  */
 app.post('/api/auth/login', async (c) => {
 	const body = await c.req.json();
@@ -90,24 +87,19 @@ app.post('/api/auth/login', async (c) => {
 		return c.json({ error: '缺少 email 或 password' }, 400);
 	}
 
-	// 1. 尋找使用者
 	const user = await c.env.DB.prepare(
     'SELECT user_id, email, password_hash, role FROM Users WHERE email = ?'
   ).bind(email).first<{ user_id: number; email: string; password_hash: string; role: string }>();
 
 	if (!user) {
-		return c.json({ error: '帳號或密碼錯誤' }, 401); // 401 Unauthorized
+		return c.json({ error: '帳號或密碼錯誤' }, 401);
 	}
 
-	// 2. 驗證密碼
 	const isPasswordValid = await bcrypt.compare(password, user.password_hash);
-
 	if (!isPasswordValid) {
 		return c.json({ error: '帳號或密碼錯誤' }, 401);
 	}
 
-	// 登入成功
-	// (未來：在這裡產生一個 JWT Token)
 	return c.json({
 		message: '登入成功',
 		user: {
@@ -119,87 +111,38 @@ app.post('/api/auth/login', async (c) => {
 	});
 });
 
-
 // ===========================================
-// === 3. API 路由 (v11 保留：全自動匯入) ===
+// === 3. API 路由 (v13 修正：匯入工具) ===
 // ===========================================
 
 /**
- * GET /admin/start-full-import
- * 啟動器：您唯一需要手動呼叫的網址
+ * GET /api/admin/batch-import
+ * 處理器 API (v9 恢復)
+ * * 處理一個批次 (例如 batch=1)，然後 "回傳 JSON 報告"。
+ * 這個 API 會被 /admin/importer 頁面上的 JavaScript 呼叫。
  */
-app.get('/admin/start-full-import', (c) => {
+app.get('/api/admin/batch-import', async (c) => {
+	const env = c.env;
+	const ctx = c.executionCtx;
+	const url = new URL(c.req.url);
+
 	try {
-		// 立即回傳訊息給使用者，告知任務已開始
-		// 並在背景 (c.executionCtx.waitUntil) 觸發第一個批次
-		c.executionCtx.waitUntil(
-			// 我們呼叫自己的 POST 處理器，從批次 1 開始
-			fetch(new URL('/admin/process-batch?batch=1', c.req.url), {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-			}),
-		);
-
-		// 立即回傳給您
-		return c.json(
-			{
-				message: '✅ 自動匯入已啟動！ (v12)',
-				details: '系統正在背景處理所有批次。您可以關閉此頁面。',
-				check_r2: '請前往 R2 儀表板 (geminilink-files) 檢查圖片是否陸續上傳。',
-				check_d1: '請前往 D1 儀表板 (geminilink_db) 檢查資料是否陸續寫入。',
-			},
-			202, // 202 Accepted: 請求已接受，正在處理
-		);
-	} catch (e: any) {
-		return c.json({ error: '啟動失敗', message: e.message }, 500);
-	}
-});
-
-/**
- * POST /admin/process-batch
- * 處理器：這個 API 會被「啟動器」或「它自己」在背景呼叫
- */
-app.post('/admin/process-batch', async (c) => {
-	// 執行批次匯入邏輯 (在背景執行)
-	// 我們將這個耗時的任務交給 c.executionCtx.waitUntil，
-	// 這樣即使呼叫端斷線，它也能繼續執行
-	c.executionCtx.waitUntil(handleBatchImport(c.req, c.env, c.executionCtx));
-
-	// 立即回傳，表示「已收到處理請求」
-	return c.json({ message: '批次處理請求已接收' }, 202);
-});
-
-// ===========================================
-// === 4. 核心匯入邏輯 (來自 v11) ===
-// ===========================================
-
-/**
- * 核心處理函式 (v11)
- * 這會在背景執行 (由 ctx.waitUntil 觸發)
- */
-async function handleBatchImport(request: Request, env: Env, ctx: ExecutionContext) {
-	const url = new URL(request.url);
-	
-	try {
-		console.log(`[handleBatchImport] 開始處理... ${url.search}`);
 		const startTime = Date.now();
 
-		// 1. 初始化服務 (從 env 取得)
+		// 1. 初始化服務
 		const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-		// v9 修正：使用您指定的 'gemini-2.5-flash' 模型
-		const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+		const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' }); // v9
 		const DB = env.DB;
 		const R2_BUCKET = env.FILES;
 
-		// 2. 取得批次編號 (例如 ?batch=1)
+		// 2. 取得批次編號
 		const batchNumber = parseInt(url.searchParams.get('batch') || '1', 10);
 		const offset = (batchNumber - 1) * BATCH_SIZE;
 
-		// 3. 從 R2 讀取 CSV 檔案
+		// 3. 從 R2 讀取 CSV
 		const csvObject = await R2_BUCKET.get(CSV_FILE_NAME);
 		if (csvObject === null) {
-			console.error(`R2 儲存桶中找不到檔案: ${CSV_FILE_NAME}`);
-			return; // 在背景中靜默失敗
+			return c.json({ error: `R2 儲存桶中找不到檔案: ${CSV_FILE_NAME}` }, 404);
 		}
 		const csvText = await csvObject.text();
 
@@ -207,29 +150,31 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 		const allProducts: any[] = parse(csvText, {
 			columns: true,
 			skip_empty_lines: true,
-			bom: true, // v4 修正：移除 Excel CSV 的 UTF-8 BOM
+			bom: true, // v4
 		});
 
 		const totalProducts = allProducts.length;
 		const productsToProcess = allProducts.slice(offset, offset + BATCH_SIZE);
 
-		// 如果沒有更多商品，回報完成
 		if (productsToProcess.length === 0) {
-			console.log('🎉 全部匯入完成！');
-			return; // 結束遞迴
+			return c.json({
+				message: '🎉 全部匯入完成！',
+				processed: 0,
+				remaining: 0,
+				totalProducts: totalProducts,
+			});
 		}
 
-		// 5. 處理這個批次的 3 筆商品
-		console.log(`[批次 ${batchNumber}] 正在處理 ${productsToProcess.length} 筆商品 (SKU: ${productsToProcess.map(p => p['商品貨號']).join(', ')})...`);
+		// 5. 處理這個批次的商品
 		const importLog: string[] = [];
 		let dbStatements: D1PreparedStatement[] = [];
 
 		for (const row of productsToProcess) {
 			const sku = row['商品貨號'];
 			const supplierId = row['供應商'] || 'WEDO';
-			if (!sku) continue; 
+			if (!sku) continue;
 
-			// 5a. 呼叫 AI 產生「主要客群」
+			// 5a. 呼叫 AI
 			const prompt = getAudiencePrompt_v7(row);
 			let audienceTags: string[] = ['other'];
 			try {
@@ -242,24 +187,19 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 				importLog.push(`SKU ${sku} AI 失敗: ${aiError.message}. 使用預設值 ['other']`);
 			}
 
-			// 5b. 準備 SQL 批次 (靜態資料)
-			// v11：呼叫更新的 getProductSqlStatements_v11
+			// 5b. 準備 SQL (v11)
 			const productStatements = getProductSqlStatements_v11(row, sku, supplierId, audienceTags, DB);
 			dbStatements.push(...productStatements);
 			importLog.push(`SKU ${sku} -> 客群: [${audienceTags.join(', ')}] -> 已準備匯入 D1`);
 
-			// 5c. 【新功能】處理圖片：下載並上傳至 R2
+			// 5c. 處理圖片
 			const imageUrls = parseImageUrls(row['商品圖檔']);
 			let imageIndex = 0;
 			for (const imageUrl of imageUrls) {
 				const isPrimary = imageIndex === 0 ? 1 : 0;
 				const r2Key = `${supplierId}/${sku}/image-${imageIndex + 1}.jpg`;
-
 				try {
-					// 執行下載和上傳 (非同步，但不 block 迴圈)
-					// 我們也必須將這個任務交給 waitUntil，確保它在背景完成
 					ctx.waitUntil(fetchAndUploadImage(imageUrl, r2Key, R2_BUCKET));
-
 					dbStatements.push(
 						DB.prepare(`INSERT OR IGNORE INTO ProductImages (sku, r2_key, is_primary) VALUES (?, ?, ?)`).bind(
 							sku,
@@ -272,10 +212,10 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 					importLog.push(`  └ 圖片 ${imageIndex + 1} (${imageUrl}) 處理失敗: ${imgError.message}`);
 				}
 				imageIndex++;
-			} 
+			}
 		}
 
-		// 6. 執行 D1 批次匯入
+		// 6. 執行 D1 批次
 		if (dbStatements.length > 0) {
 			await DB.batch(dbStatements);
 		} else {
@@ -286,38 +226,205 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 		const nextBatch = batchNumber + 1;
 		const remaining = totalProducts - (offset + productsToProcess.length);
 
-		console.log(`[批次 ${batchNumber}] ✅ 完成。耗時 ${endTime - startTime}ms。`);
-		console.log(importLog.join('\n'));
-		
-		// 7. 【關鍵】檢查是否還有剩餘，並觸發下一個批次
-		if (remaining > 0) {
-			console.log(`[批次 ${batchNumber}] 偵測到還有 ${remaining} 筆，正在觸發下一批次 (batch=${nextBatch})...`);
-			
-			// 構造下一個批次的 URL
-			const nextUrl = new URL(request.url);
-      // 確保我們呼叫的是絕對路徑
-      nextUrl.pathname = '/admin/process-batch';
-			nextUrl.searchParams.set('batch', nextBatch.toString());
-			
-			// 在背景中呼叫自己
-			ctx.waitUntil(
-				fetch(nextUrl.toString(), {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-				})
-			);
-		} else {
-			console.log(`[批次 ${batchNumber}] 🎉 全部 ${totalProducts} 筆商品匯入完成！`);
-		}
-		
+		// 7. 回傳 JSON 報告
+		return c.json({
+			message: `✅ 批次 ${batchNumber} 完成。`,
+			processed: productsToProcess.length,
+			remaining: remaining,
+			totalProducts: totalProducts,
+			nextBatch: remaining > 0 ? nextBatch : null,
+			duration: `${(endTime - startTime) / 1000} 秒`,
+			logs: importLog,
+		});
 	} catch (e: any) {
-		console.error(`[批次處理失敗] ${e.message}`, e.stack);
+		return c.json({ error: '批次匯入失敗', message: e.message, stack: e.stack }, 500);
 	}
-}
+});
 
+/**
+ * GET /admin/importer
+ * 匯入工具 UI (v13 新增)
+ * * 回傳一個 HTML 頁面，頁面上的 JavaScript 會自動執行批次匯入
+ * 並在畫面上顯示即時日誌。
+ */
+app.get('/admin/importer', (c) => {
+	// 我們使用 Hono 的 'html' 輔助工具來回傳 HTML 內容
+	return c.html(html`
+		<!DOCTYPE html>
+		<html lang="zh-Hant">
+			<head>
+				<meta charset="UTF-8" />
+				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+				<title>雙核星鏈 - 即時匯入工具</title>
+				<style>
+					body {
+						font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+						margin: 0;
+						padding: 2rem;
+						background-color: #f4f7f6;
+						color: #333;
+					}
+					#root {
+						max-width: 800px;
+						margin: 0 auto;
+						padding: 2rem;
+						background-color: #ffffff;
+						border-radius: 8px;
+						box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+					}
+					h1 {
+						color: #111;
+						border-bottom: 2px solid #eee;
+						padding-bottom: 10px;
+					}
+					button {
+						font-size: 1rem;
+						padding: 10px 15px;
+						color: #fff;
+						background-color: #007bff;
+						border: none;
+						border-radius: 5px;
+						cursor: pointer;
+						transition: background-color 0.2s;
+					}
+					button:disabled {
+						background-color: #ccc;
+						cursor: not-allowed;
+					}
+					button:hover:not(:disabled) {
+						background-color: #0056b3;
+					}
+					#logs {
+						font-family: 'SF Mono', 'Consolas', 'Menlo', monospace;
+						font-size: 0.85rem;
+						background-color: #2b2b2b;
+						color: #f8f8f2;
+						padding: 1rem;
+						border-radius: 5px;
+						margin-top: 1.5rem;
+						max-height: 400px;
+						overflow-y: auto;
+						white-space: pre-wrap;
+						word-wrap: break-word;
+					}
+					.log-entry {
+						padding: 2px 0;
+						border-bottom: 1px solid #444;
+					}
+					.log-entry.batch-start {
+						color: #50e3c2; /* 亮青色 */
+						font-weight: bold;
+						margin-top: 10px;
+					}
+					.log-entry.error {
+						color: #ff4d4d; /* 紅色 */
+					}
+					.log-entry.success {
+						color: #7ed321; /* 綠色 */
+						font-size: 1.1rem;
+						font-weight: bold;
+					}
+					#status {
+						font-size: 1.1rem;
+						font-weight: 500;
+						margin-top: 1rem;
+					}
+				</style>
+			</head>
+			<body>
+				<div id="root">
+					<h1>雙核星鏈 (GeminiLink) - 即時匯入工具 (v13)</h1>
+					<p>點擊按鈕開始將 R2 (geminilink-files) 中的 CSV 檔案匯入 D1 (geminilink_db)。</p>
+					<p>匯入將在您的瀏覽器中自動分批執行，請保持此頁面開啟直到完成。</p>
+					<button id="start-button">開始全自動匯入</button>
+					
+					<div id="status">狀態：待命中...</div>
+					<div id="logs">
+						<div class="log-entry">等待開始...</div>
+					</div>
+				</div>
+
+				<script>
+					const startButton = document.getElementById('start-button');
+					const logsContainer = document.getElementById('logs');
+					const statusElement = document.getElementById('status');
+					let totalProducts = 0;
+
+					startButton.addEventListener('click', () => {
+						startButton.disabled = true;
+						startButton.textContent = '匯入中...';
+						addLog('初始化...', 'batch-start');
+						runBatch(1); // 從批次 1 開始
+					});
+
+					async function runBatch(batchNumber) {
+						if (!batchNumber) {
+							addLog('🎉 全部匯入完成！', 'success');
+							statusElement.textContent = \`狀態：全部 \${totalProducts} 筆商品已完成匯入！\`;
+							startButton.disabled = false;
+							startButton.textContent = '重新開始';
+							return;
+						}
+
+						statusElement.textContent = \`狀態：正在處理批次 \${batchNumber}...\`;
+						addLog(\`--- 開始處理批次 \${batchNumber} --- \`, 'batch-start');
+
+						try {
+							// 呼叫我們自己的 v13 API
+							const response = await fetch(\`/api/admin/batch-import?batch=\${batchNumber}\`);
+							if (!response.ok) {
+								const errData = await response.json().catch(() => ({}));
+								throw new Error(\`HTTP 錯誤！狀態: \${response.status} - \${errData.message || response.statusText}\`);
+							}
+							
+							const data = await response.json();
+
+							if (data.error) {
+								throw new Error(data.message);
+							}
+							
+							// 顯示 AI 和圖片處理日誌
+							if (data.logs && Array.isArray(data.logs)) {
+								data.logs.forEach(log => addLog(log));
+							}
+
+							totalProducts = data.totalProducts || totalProducts;
+							const processedCount = (totalProducts - (data.remaining || 0));
+							statusElement.textContent = \`狀態：批次 \${batchNumber} 完成。 (\${processedCount} / \${totalProducts})\`;
+							
+							// 遞迴呼叫下一個批次
+							setTimeout(() => {
+								runBatch(data.nextBatch);
+							}, 500); // 批次之間延遲 0.5 秒
+
+						} catch (error) {
+							addLog(\`批次 \${batchNumber} 失敗: \${error.message}\`, 'error');
+							statusElement.textContent = \`狀態：批次 \${batchNumber} 失敗。請檢查日誌並重試。\`;
+							startButton.disabled = false;
+							startButton.textContent = '重試';
+						}
+					}
+
+					function addLog(message, type = '') {
+						// 第一次清除 "等待開始"
+						if (logsContainer.children.length === 1 && logsContainer.children[0].textContent === '等待開始...') {
+							logsContainer.innerHTML = '';
+						}
+						const entry = document.createElement('div');
+						entry.className = \`log-entry \${type}\`;
+						entry.textContent = message;
+						logsContainer.appendChild(entry);
+						// 自動捲動到底部
+						logsContainer.scrollTop = logsContainer.scrollHeight;
+					}
+				</script>
+			</body>
+		</html>
+	`);
+});
 
 // ===========================================
-// === 5. 輔助函式 (Helpers) ===
+// === 5. 輔助函式 (Helpers) (來自 v11) ===
 // ===========================================
 
 /**
@@ -407,7 +514,7 @@ function getProductSqlStatements_v11(
 				sku,
 				supplierId,
 				row['產品名稱'] || '',
-				row['英文品名'] || '', // 【新】英文品名
+				row['英文品名'] || '', // 【v11 新增】英文品名
 				row['國際條碼'] || null,
 				row['品牌名稱'] || '',
 				row['商品介紹'] || '',
@@ -417,7 +524,7 @@ function getProductSqlStatements_v11(
 				row['產地'] || '',
 				parseInt(String(row['建議售價']).replace('$', '')) || 0,
 				row['箱入數'] || '',
-				row['現貨商品'] === '是' ? 1 : 0 // 【新】現貨商品 (1=是, 0=否)
+				row['現貨商品'] === '是' ? 1 : 0 // 【v11 新增】現貨商品
 			),
 	);
 
