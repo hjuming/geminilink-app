@@ -3,12 +3,12 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { parse } from 'csv-parse/browser/esm/sync';
 
 /**
- * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v5 - 模型修正版)
+ * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v7 - AI 規則更新)
  *
  * 環境變數 (來自 wrangler.toml 和 Cloudflare Secrets):
  * - env.DB: 我們的 D1 資料庫 (geminilink_db)
  * - env.FILES: 我們的 R2 儲存桶 (geminilink-files)
- * - env.GEMINI_API_KEY: 您的 Gemini API 金鑰 (來自 Cloudflare Secrets)
+ * - env.GEMINI_API KEY: 您的 Gemini API 金鑰 (來自 Cloudflare Secrets)
  */
 export interface Env {
 	DB: D1Database;
@@ -39,14 +39,9 @@ export default {
 
 			// 1. 初始化服務 (從 env 取得)
 			const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-			
-            // 修正 v5：切換到 'gemini-pro' 模型
-            // 'gemini-1.5-flash' 似乎在您的專案中不可用 (404 Not Found)
-            // 'gemini-pro' 是最穩定且通用的模型
-			const model = genAI.getGenerativeModel({ model: 'gemini-pro' }); 
-			
-            const DB = env.DB;
-			const R2_BUCKET = env.FILES; // 修正 v3：使用 env.FILES
+			const model = genAI.getGenerativeModel({ model: 'gemini-pro' }); // 使用 v5 的 'gemini-pro'
+			const DB = env.DB;
+			const R2_BUCKET = env.FILES;
 
 			// 2. 取得批次編號 (例如 ?batch=1)
 			const batchNumber = parseInt(url.searchParams.get('batch') || '1', 10);
@@ -87,21 +82,20 @@ export default {
 				if (!sku) continue; // 跳過空行
 
 				// 5a. 呼叫 AI 產生「主要客群」
-				const prompt = getAudiencePrompt(row);
-				let audienceTags: string[] = ['其他']; // 預設值
+				// *** v7 修正：呼叫包含您最新規則的 Prompt ***
+				const prompt = getAudiencePrompt_v7(row);
+				let audienceTags: string[] = ['other']; // 預設值 (英文)
 				try {
 					const result = await model.generateContent(prompt);
 					const response = result.response.text().trim();
-                    // gemini-pro 的回應可能不包含 ```json
 					const cleanedResponse = response.replace(/```json/g, '').replace(/```/g, '').trim();
 					const parsedResponse = JSON.parse(cleanedResponse);
-					audienceTags = Array.isArray(parsedResponse) ? parsedResponse.filter(Boolean) : ['其他'];
+					audienceTags = Array.isArray(parsedResponse) ? parsedResponse.filter(Boolean) : ['other'];
 				} catch (aiError: any) {
-					importLog.push(`SKU ${sku} AI 失敗: ${aiError.message}. 使用預設值 ['其他']`);
+					importLog.push(`SKU ${sku} AI 失敗: ${aiError.message}. 使用預設值 ['other']`);
 				}
 
 				// 5b. 準備 SQL 批次 (靜態資料)
-				// 修正 v3：將 DB 實例傳遞給輔助函式
 				const productStatements = getProductSqlStatements(row, sku, supplierId, audienceTags, DB);
 				dbStatements.push(...productStatements);
 				importLog.push(`SKU ${sku} -> 客群: [${audienceTags.join(', ')}] -> 已準備匯入 D1`);
@@ -134,7 +128,7 @@ export default {
 			} // 商品迴圈結束
 
 			// 6. 執行 D1 批次匯入 (包含所有商品資料 + 圖片資料)
-			if (dbStatements.length > 0) { // 修正 v4：確保有 SQL 才執行
+			if (dbStatements.length > 0) {
 				await DB.batch(dbStatements);
 			} else {
 				importLog.push('警告：這個批次沒有產生任何 SQL 語句。');
@@ -150,7 +144,7 @@ export default {
 				processed: productsToProcess.length,
 				remaining: remaining,
 				totalProducts: totalProducts,
-				nextBatch: remaining > 0 ? nextBatch : null, // 提示下一個批次
+				nextBatch: remaining > 0 ? nextBatch : null,
 				duration: `${(endTime - startTime) / 1000} 秒`,
 				logs: importLog,
 			});
@@ -162,24 +156,34 @@ export default {
 };
 
 /**
- * AI 提示模板
+ * AI 提示模板 (v7 規則更新版)
  * 根據商品資料產生「主要客群」
  */
-function getAudiencePrompt(product: any): string {
+function getAudiencePrompt_v7(product: any): string { // v7 函式名稱更新
 	const description = (product['商品介紹'] || '').substring(0, 300);
 	return `
 		你是一個資料庫ETL專家。
-		請根據以下商品資料，判斷其主要適用物種。
-		
+		請根據以下商品資料，判斷其主要適用物種 (Audience)。
+
 		產品名稱: ${product['產品名稱']}
 		類別: ${product['類別']}
 		商品介紹: ${description}
 
-		你的回答必須是一個 JSON 陣列，只能包含 "狗", "貓", "人", "其他" 這幾個值。
+		你的回答必須是一個 JSON 陣列，只能包含 "Dog", "Cat", "Humans", "other" 這幾個值。
+		
+		**重要規則:**
+		1.  **"SPA礦泉浴", "香薰浴鹽", "深海泥洗護"** 這類美容/SPA產品，請根據商品介紹判斷是給寵物 (Dog/Cat) 還是人類 (Humans) 使用。如果介紹中提到 "狗狗" 或 "貓咪"，請分類為 ["Dog", "Cat"] (如果貓狗通用) 或 ["Dog"] (如果只給狗)。
+		2.  **"包包", "鑰匙圈", "配件"** 這類商品應分類為 ["Humans"]。
+		3.  "迷你犬", "狗狗", "BokBok for Dog" = ["Dog"]
+		4.  "貓咪", "貓罐", "BokBok for Cat" = ["Cat"]
+		5.  如果商品介紹明顯提到貓狗通用 = ["Dog", "Cat"]
+		6.  如果都無法判斷 = ["other"]
+
 		範例:
-		- 如果是狗用品: ["狗"]
-		- 如果是貓用品: ["貓"]
-		- 如果是貓狗通用: ["狗", "貓"]
+		- 產品名稱 "耐咬史迪克-XS（迷你犬）": ["Dog"]
+		- 產品名稱 "毛孩快跑-橘鮮蝦貓罐": ["Cat"]
+		- 產品名稱 "SPA礦泉浴", 介紹 "讓狗狗的毛髮...": ["Dog"]
+		- 產品名稱 "寵物造型鑰匙圈": ["Humans"]
 	`;
 }
 
@@ -188,47 +192,39 @@ function getAudiencePrompt(product: any): string {
  */
 function parseImageUrls(cellContent: string): string[] {
 	if (!cellContent) return [];
-	// Regex: 尋找所有被括號包住的 https 網址
 	const urlRegex = /\((https:\/\/[^)]+)\)/g;
 	const matches = cellContent.matchAll(urlRegex);
-	// matches 是一個 iterator, [1] 是第一個捕獲組 (網址本身)
 	return Array.from(matches, (match) => match[1]);
 }
 
 /**
  * 【新】輔助函式：從 URL 下載圖片並上傳到 R2
- * 這是一個非同步函式，會在背景執行
  */
 async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket) {
 	try {
-		// 1. 下載圖片
 		const response = await fetch(url);
 		if (!response.ok) {
 			throw new Error(`下載失敗: ${response.status} ${response.statusText}`);
 		}
 		const imageBuffer = await response.arrayBuffer();
 		const contentType = response.headers.get('Content-Type') || 'image/jpeg';
-
-		// 2. 上傳到 R2
 		await bucket.put(r2Key, imageBuffer, {
 			httpMetadata: { contentType },
 		});
 	} catch (error: any) {
 		console.error(`圖片處理失敗 (URL: ${url}, R2Key: ${r2Key}): ${error.message}`);
-		// 即使失敗也不拋出錯誤，以免中斷主流程
 	}
 }
 
 /**
  * 輔助函式：準備 D1 商品資料 (不含圖片)
- * 修正 v3：傳入 DB 實例
  */
 function getProductSqlStatements(
 	row: any,
 	sku: string,
 	supplierId: string,
 	audienceTags: string[],
-	db: D1Database, // 修正：接收 D1 實例
+	db: D1Database,
 ): D1PreparedStatement[] {
 	const statements: D1PreparedStatement[] = [];
 
@@ -243,14 +239,14 @@ function getProductSqlStatements(
 				sku,
 				supplierId,
 				row['產品名稱'] || '',
-				row['國際條碼'] || null, // 允許條碼為空
+				row['國際條碼'] || null,
 				row['品牌名稱'] || '',
 				row['商品介紹'] || '',
 				row['成份/材質'] || '',
 				row['商品尺寸'] || '',
 				parseFloat(row['重量g']) || 0,
 				row['產地'] || '',
-				parseInt(String(row['建議售價']).replace('$', '')) || 0, // 處理 '$' 符號
+				parseInt(String(row['建議售價']).replace('$', '')) || 0,
 				row['箱入數'] || '',
 			),
 	);
@@ -276,7 +272,7 @@ function getProductSqlStatements(
 
 	// 4. 寫入 'ProductAudience' (AI 產生的)
 	for (const tag of audienceTags) {
-		if (tag) { // 確保標籤不是 null 或空字串
+		if (tag) {
 			statements.push(db.prepare(`INSERT OR IGNORE INTO ProductAudience (sku, audience_tag) VALUES (?, ?)`).bind(sku, tag));
 		}
 	}
