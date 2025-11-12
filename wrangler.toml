@@ -14,6 +14,6 @@ database_name = "geminilink_db"
 binding = "FILES"
 bucket_name = "geminilink-files"
 
-# 移除 [vars] 區塊
-# 您的 GEMINI_API_KEY 將會作為 "Secret" (機密) 變數
+# 您的 GEMINI_API_KEY 將作為 "Secret" (機密) 變數
+# 從 Cloudflare 儀表板 (Settings > Environment Variables > Secrets)
 # 自動注入到 env.GEMINI_API_KEY 中
