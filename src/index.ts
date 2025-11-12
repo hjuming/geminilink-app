@@ -1,11 +1,11 @@
 /*
  * 檔案: src/index.ts
- * 版本: V19 (使用 fetch 取代 Airtable 套件)
+ * 版本: V20 (新增註冊頁面)
  * 備註:
- * - [關鍵修正] 移除了 "airtable" 套件的 import。
- * - [關鍵修正] /api/admin/batch-import API 現在使用
- * Cloudflare 原生的 "fetch" API 來抓取 Airtable 資料，
- * 這 100% 相容於 Worker 環境。
+ * - [v20 新增] /admin/register API 路由，
+ * 提供一個 HTML 頁面來呼叫 /api/auth/register。
+ * - 保留了 v19 的所有 API (auth, airtable-tables, batch-import)
+ * 和 v18 的 importer UI。
  */
 
 import { Hono } from 'hono';
@@ -31,9 +31,181 @@ const BCRYPT_SALT_ROUNDS = 10;
 const app = new Hono<{ Bindings: Env }>();
 
 // ===========================================
+// === 1. v20 新增：註冊 UI (HTML 頁面) ===
+// ===========================================
+app.get('/admin/register', (c) => {
+	return c.html(html`
+		<!DOCTYPE html>
+		<html lang="zh-Hant">
+			<head>
+				<meta charset="UTF-8" />
+				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+				<title>雙核星鏈 - 建立管理員帳號</title>
+				<style>
+					body {
+						font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+						margin: 0;
+						padding: 2rem;
+						background-color: #f4f7f6;
+						display: flex;
+						justify-content: center;
+						align-items: center;
+						min-height: 100vh;
+					}
+					#root {
+						width: 100%;
+						max-width: 400px;
+						padding: 2rem;
+						background-color: #ffffff;
+						border-radius: 8px;
+						box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+					}
+					h1 {
+						color: #111;
+						text-align: center;
+						border-bottom: 2px solid #eee;
+						padding-bottom: 10px;
+						margin-top: 0;
+					}
+					form {
+						display: grid;
+						gap: 1rem;
+					}
+					.form-group {
+						display: flex;
+						flex-direction: column;
+					}
+					.form-group label {
+						font-size: 0.85rem;
+						font-weight: 500;
+						margin-bottom: 4px;
+						color: #555;
+					}
+					.form-group input {
+						font-size: 1rem;
+						padding: 10px;
+						border: 1px solid #ccc;
+						border-radius: 5px;
+					}
+					button {
+						font-size: 1rem;
+						padding: 12px 15px;
+						color: #fff;
+						background-color: #28a745; /* 綠色 */
+						border: none;
+						border-radius: 5px;
+						cursor: pointer;
+						transition: background-color 0.2s;
+					}
+					button:disabled {
+						background-color: #ccc;
+						cursor: not-allowed;
+					}
+					button:hover:not(:disabled) {
+						background-color: #218838;
+					}
+					#status {
+						font-family: 'SF Mono', 'Consolas', 'Menlo', monospace;
+						font-size: 0.9rem;
+						padding: 10px;
+						border-radius: 5px;
+						margin-top: 1rem;
+						text-align: center;
+						display: none; /* 預設隱藏 */
+					}
+					#status.success {
+						background-color: #e6ffed;
+						color: #218838;
+						display: block;
+					}
+					#status.error {
+						background-color: #ffebee;
+						color: #c53030;
+						display: block;
+					}
+				</style>
+			</head>
+			<body>
+				<div id="root">
+					<h1>建立 Admin 帳號</h1>
+					<p style="text-align: center; color: #555; margin-top: -10px; margin-bottom: 20px;">
+						(僅限系統初始化時使用)
+					</p>
+					<form id="register-form">
+						<div class="form-group">
+							<label for="email">Email (您的登入帳號)</label>
+							<input type="email" id="email" name="email" required />
+						</div>
+						<div class="form-group">
+							<label for="password">Password (您的登入密碼)</label>
+							<input type="password" id="password" name="password" required />
+						</div>
+						<div class="form-group">
+							<label for="key">註冊安全碼 (Registration Key)</label>
+							<input
+								type="password"
+								id="key"
+								name="key"
+								placeholder="您在 GitHub Secrets 設定的值"
+								required
+							/>
+						</div>
+						<button id="submit-button" type="submit">建立帳號</button>
+					</form>
+					<div id="status"></div>
+				</div>
+
+				<script>
+					const form = document.getElementById('register-form');
+					const statusElement = document.getElementById('status');
+					const submitButton = document.getElementById('submit-button');
+
+					form.addEventListener('submit', async (e) => {
+						e.preventDefault();
+						statusElement.textContent = '處理中...';
+						statusElement.className = '';
+						submitButton.disabled = true;
+						submitButton.textContent = '建立中...';
+
+						const formData = new FormData(form);
+						const data = Object.fromEntries(formData.entries());
+
+						try {
+							const response = await fetch('/api/auth/register', {
+								method: 'POST',
+								headers: {
+									'Content-Type': 'application/json',
+								},
+								body: JSON.stringify(data),
+							});
+
+							const result = await response.json();
+
+							if (!response.ok) {
+								throw new Error(result.error || '發生未知錯誤');
+							}
+
+							statusElement.textContent = \`✅ 成功！ \${result.message}\`;
+							statusElement.className = 'success';
+							form.reset();
+						} catch (error) {
+							statusElement.textContent = \`🔴 錯誤： \${error.message}\`;
+							statusElement.className = 'error';
+						} finally {
+							submitButton.disabled = false;
+							submitButton.textContent = '建立帳號';
+						}
+					});
+				</script>
+			</body>
+		</html>
+	`);
+});
+
+// ===========================================
 // === 2. API 路由 (v12 保留：認證) ===
 // ===========================================
-// (此區塊程式碼與 v18 相同，保持不變)
+// (此區塊程式碼與 v19 相同，保持不變)
 app.post('/api/auth/register', async (c) => {
 	const body = await c.req.json();
 	const { email, password, key } = body;
@@ -67,8 +239,8 @@ app.post('/api/auth/login', async (c) => {
 		return c.json({ error: '缺少 email 或 password' }, 400);
 	}
 	const user = await c.env.DB.prepare(
-    'SELECT user_id, email, password_hash, role FROM Users WHERE email = ?'
-  ).bind(email).first<{ user_id: number; email: string; password_hash: string; role: string }>();
+		'SELECT user_id, email, password_hash, role FROM Users WHERE email = ?',
+	).bind(email).first<{ user_id: number; email: string; password_hash: string; role: string }>();
 	if (!user) {
 		return c.json({ error: '帳號或密碼錯誤' }, 401);
 	}
@@ -82,15 +254,10 @@ app.post('/api/auth/login', async (c) => {
 	});
 });
 
-
 // ===========================================
 // === 3. API 路由 (v19 升級：匯入) ===
 // ===========================================
-
-/**
- * [v18 保留] API 1: 取得 Airtable Base 中的所有表格
- * (此 API 已使用 fetch，保持不變)
- */
+// (此區塊程式碼與 v19 相同，保持不變)
 app.get('/api/admin/airtable-tables', async (c) => {
 	const env = c.env;
 	try {
@@ -116,11 +283,6 @@ app.get('/api/admin/airtable-tables', async (c) => {
 	}
 });
 
-
-/**
- * [v19 升級] API 2: 批次匯入
- * (使用 fetch 取代 airtable 套件)
- */
 app.get('/api/admin/batch-import', async (c) => {
 	const env = c.env;
 	const url = new URL(c.req.url);
@@ -132,7 +294,7 @@ app.get('/api/admin/batch-import', async (c) => {
 		const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 		const DB = env.DB;
 		const R2_BUCKET = env.FILES;
-		
+
 		// 2. 取得 URL 參數
 		const offset = url.searchParams.get('offset') || undefined;
 		const tableId = url.searchParams.get('table_id');
@@ -148,8 +310,7 @@ app.get('/api/admin/batch-import', async (c) => {
 		if (offset) {
 			airtableUrl.searchParams.set('offset', offset);
 		}
-		// (可以添加 'sort' 參數來確保順序一致, 但目前暫不實作)
-
+		
 		const response = await fetch(airtableUrl.toString(), {
 			headers: {
 				Authorization: `Bearer ${env.AIRTABLE_API_KEY}`,
@@ -160,10 +321,10 @@ app.get('/api/admin/batch-import', async (c) => {
 			const errText = await response.text();
 			throw new Error(`Airtable Data API 錯誤: ${response.status} ${errText}`);
 		}
-		
+
 		const data: any = await response.json();
 		const productsToProcess = data.records.map((record: any) => record.fields);
-		const newOffset = data.offset; // Airtable 會在最後一頁時回傳 undefined
+		const newOffset = data.offset;
 
 		if (productsToProcess.length === 0) {
 			return c.json({
@@ -189,7 +350,7 @@ app.get('/api/admin/batch-import', async (c) => {
 				importLog.push(`🔴 SKU ${sku} 失敗：無法建立供應商 "${supplierId}": ${supplierError.message}`);
 				continue;
 			}
-			
+
 			// 5b. 呼叫 AI
 			const prompt = getAudiencePrompt_v7(row);
 			let audienceTags: string[] = ['other'];
@@ -216,7 +377,7 @@ app.get('/api/admin/batch-import', async (c) => {
 				if (!imageUrl) continue;
 
 				const isPrimary = imageIndex === 0 ? 1 : 0;
-				const r2Key = `${supplierId}/${sku}/image-${imageIndex + 1}.jpg`; 
+				const r2Key = `${supplierId}/${sku}/image-${imageIndex + 1}.jpg`;
 				try {
 					await fetchAndUploadImage(imageUrl, r2Key, R2_BUCKET);
 					dbStatements.push(
@@ -247,7 +408,7 @@ app.get('/api/admin/batch-import', async (c) => {
 		return c.json({
 			message: `✅ 批次 (Table: ${tableId}, Offset: ${offset || 'start'}) 完成。`,
 			processed: productsToProcess.length,
-			nextOffset: newOffset || null, // v19 升級：Airtable 會在最後一頁回傳 undefined
+			nextOffset: newOffset || null,
 			duration: `${(endTime - startTime) / 1000} 秒`,
 			logs: importLog,
 		});
@@ -261,7 +422,7 @@ app.get('/api/admin/batch-import', async (c) => {
  * 匯入工具 UI (v18 保留)
  */
 app.get('/admin/importer', (c) => {
-	// (此 HTML/JS 介面與 v18 相同，保持不變)
+	// (此 HTML/JS 介面與 v19 相同，保持不變)
 	return c.html(html`
 		<!DOCTYPE html>
 		<html lang="zh-Hant">
@@ -331,7 +492,8 @@ app.get('/admin/importer', (c) => {
 						margin-bottom: 4px;
 						color: #555;
 					}
-					.form-group select, .form-group input {
+					.form-group select,
+					.form-group input {
 						font-size: 1rem;
 						padding: 10px;
 						border: 1px solid #ccc;
@@ -381,7 +543,7 @@ app.get('/admin/importer', (c) => {
 				<div id="root">
 					<h1>雙核星鏈 (GeminiLink) - Airtable 匯入工具 (v19)</h1>
 					<p>系統已自動抓取您 Airtable Base 中的所有表格。請選擇要匯入的表格，並手動指定一個供應商 ID。</p>
-					
+
 					<div id="importer-form">
 						<div class="form-group">
 							<label for="table-select">1. 選擇 Airtable 表格</label>
@@ -395,7 +557,7 @@ app.get('/admin/importer', (c) => {
 						</div>
 						<button id="start-button" disabled>載入表格中...</button>
 					</div>
-					
+
 					<div id="status">狀態：待命中...</div>
 					<div id="logs">
 						<div class="log-entry">等待開始...</div>
@@ -417,9 +579,9 @@ app.get('/admin/importer', (c) => {
 								throw new Error('無法抓取表格列表');
 							}
 							const tables = await response.json();
-							
+
 							tableSelect.innerHTML = '<option value="">-- 請選擇一個表格 --</option>';
-							tables.forEach(table => {
+							tables.forEach((table) => {
 								const option = document.createElement('option');
 								option.value = table.id;
 								option.textContent = table.name;
@@ -428,7 +590,6 @@ app.get('/admin/importer', (c) => {
 							tableSelect.disabled = false;
 							startButton.disabled = false;
 							startButton.textContent = '開始全自動匯入';
-
 						} catch (error) {
 							addLog(\`🔴 嚴重錯誤：無法載入 Airtable 表格列表。 \${error.message}\`, 'error');
 							statusElement.textContent = '狀態：初始化失敗。';
@@ -459,7 +620,8 @@ app.get('/admin/importer', (c) => {
 
 					async function runBatch(tableId, supplierId, offset) {
 						// v19 升級：Airtable 在最後一頁會回傳 "null" 或 "undefined"
-						if (!offset && offset !== null) { // 只有在 offset 是 null 或 undefined 時才停止
+						if (!offset && offset !== null) {
+							// 只有在 offset 是 null 或 undefined 時才停止
 							addLog(\`🎉 全部匯入完成！總共處理 \${totalProcessed} 筆商品。\`, 'success');
 							statusElement.textContent = \`狀態：全部 \${totalProcessed} 筆商品已完成匯入！\`;
 							startButton.disabled = false;
@@ -471,7 +633,10 @@ app.get('/admin/importer', (c) => {
 
 						const offsetString = offset || 'START';
 						statusElement.textContent = \`狀態：正在處理 (Offset: \${offsetString})...\`;
-						addLog(\`--- 開始處理 (Table: \${tableId}, Supplier: \${supplierId}, Offset: \${offsetString}) --- \`, 'batch-start');
+						addLog(
+							\`--- 開始處理 (Table: \${tableId}, Supplier: \${supplierId}, Offset: \${offsetString}) --- \`,
+							'batch-start',
+						);
 
 						try {
 							const apiUrl = new URL('/api/admin/batch-import', window.location.origin);
@@ -482,19 +647,19 @@ app.get('/admin/importer', (c) => {
 							}
 
 							const response = await fetch(apiUrl.toString());
-							
+
 							if (!response.ok) {
 								const errData = await response.json().catch(() => ({}));
 								throw new Error(\`HTTP 錯誤！狀態: \${response.status} - \${errData.message || response.statusText}\`);
 							}
-							
+
 							const data = await response.json();
 							if (data.error) {
 								throw new Error(data.message);
 							}
-							
+
 							if (data.logs && Array.isArray(data.logs)) {
-								data.logs.forEach(log => {
+								data.logs.forEach((log) => {
 									const isError = log.includes('失敗') || log.includes('🔴');
 									addLog(log, isError ? 'error' : '');
 								});
@@ -502,12 +667,11 @@ app.get('/admin/importer', (c) => {
 
 							totalProcessed += data.processed || 0;
 							statusElement.textContent = \`狀態：批次完成。 (已處理 \${totalProcessed} 筆商品)\`;
-							
+
 							const nextOffset = data.nextOffset; // v19 升級：Airtable 會在最後一頁回傳 undefined/null
 							setTimeout(() => {
 								runBatch(tableId, supplierId, nextOffset);
-							}, 500); 
-
+							}, 500);
 						} catch (error) {
 							addLog(\`批次 (Offset: \${offsetString}) 失敗: \${error.message}\`, 'error');
 							statusElement.textContent = \`狀態：批次 (Offset: \${offsetString}) 失敗。請檢查日誌並重試。\`;
@@ -537,7 +701,7 @@ app.get('/admin/importer', (c) => {
 // ===========================================
 // === 5. 輔助函式 (Helpers) (v16 修改) ===
 // ===========================================
-// (此區塊程式碼與 v18 相同，保持不變)
+// (此區塊程式碼與 v19 相同，保持不變)
 /**
  * v14 新增：確保供應商存在
  */
@@ -552,7 +716,6 @@ async function ensureSupplierExists(db: D1Database, supplierId: string) {
 		.run();
 	console.warn(`自動建立了新供應商: ${supplierId}`);
 }
-
 
 /**
  * AI 提示模板 (v7 規則更新版)
@@ -605,7 +768,7 @@ async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket)
 	}
 	const imageBuffer = await response.arrayBuffer();
 	const contentType = response.headers.get('Content-Type') || 'image/jpeg';
-	
+
 	await bucket.put(r2Key, imageBuffer, {
 		httpMetadata: { contentType },
 	});
@@ -637,7 +800,7 @@ function getProductSqlStatements_v16(
 				sku,
 				supplierId,
 				row['產品名稱'] || '',
-				row['英文品名'] || '', 
+				row['英文品名'] || '',
 				row['國際條碼'] || null,
 				row['品牌名稱'] || '',
 				row['商品介紹'] || '',
@@ -647,7 +810,7 @@ function getProductSqlStatements_v16(
 				row['產地'] || '',
 				parseInt(String(row['建議售價']).replace('$', '')) || 0,
 				row['箱入數'] || '',
-				row['現貨商品'] === '是' ? 1 : 0
+				row['現貨商品'] === '是' ? 1 : 0,
 			),
 	);
 
@@ -660,7 +823,7 @@ function getProductSqlStatements_v16(
 			.bind(
 				sku,
 				0, // v16: 預設為 0
-				0  // v16: 預設為 0
+				0, // v16: 預設為 0
 			),
 	);
 
