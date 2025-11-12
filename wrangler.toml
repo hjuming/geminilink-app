@@ -7,6 +7,7 @@ compatibility_date = "2025-11-12" # 您可以保留您自己的日期
 [[d1_databases]]
 binding = "DB"
 database_name = "geminilink_db"
+database_id = "07c62404-613b-48ce-af4b-88bb5c596110" # <-- ID 已更新
 
 # 綁定 R2 儲存桶 (geminilink-files)
 # 您的程式碼將可以透過 `env.FILES` 來存取
