@@ -1,7 +1,9 @@
 # .github/workflows/deploy-worker.yml
 #
-# 這個 GitHub Action 會在您 "push" (推送) 程式碼到 "main" (主) 分支時自動觸發。
-# 它會執行 `npx wrangler deploy`，將您的 Worker 部署到 Cloudflare。
+# v3 最終版：
+# 1. 增加了一個 "Set Secret" 步驟。
+# 2. 這個 workflow 會在 "push" (推送) 程式碼到 "main" (主) 分支時自動觸發。
+# 3. 它會將所有 GitHub Secrets 安全地傳遞給 Cloudflare。
 
 name: Deploy GeminiLink Worker
 
@@ -18,21 +20,28 @@ jobs:
       - name: Checkout (取得程式碼)
         uses: actions/checkout@v4
 
-      # 您的專案使用 bun, 我們需要安裝它
       - name: Setup Bun (安裝 Bun)
         uses: oven-sh/setup-bun@v2
 
       - name: Install dependencies (安裝依賴套件)
         run: bun install --frozen-lockfile
 
-      - name: Deploy to Cloudflare (部署到 Cloudflare)
-        run: npx wrangler deploy
+      # 
+      # 步驟 A：將 GitHub Secret (GEMINI_API_KEY) 注入到 Cloudflare Secrets
+      # 這是我們的 "Runtime" (執行時) 金鑰
+      #
+      - name: Set Gemini API Key Secret (設定 Gemini 金鑰)
+        run: echo ${{ secrets.GEMINI_API_KEY }} | npx wrangler secret put GEMINI_API_KEY
         env:
-          # 這裡會讀取您在 GitHub Repository Secrets 中設定的機密
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          #
-          # 注意：GEMINI_API_KEY 是一個 "runtime" secret (執行時機密)
-          # 它 "必須" 在 Cloudflare 儀表板中設定
-          # ( geminilink-app > Settings > Environment Variables > Secrets )
-          # 這樣您的 "src/index.ts" 程式碼才能在執行時透過 env.GEMINI_API_KEY 讀取到它。
+
+      #
+      # 步驟 B：部署 Worker 程式碼
+      # 這是我們的 "Deploy-time" (部署時) 金鑰
+      #
+      - name: Deploy to Cloudflare (部署 Worker)
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
