@@ -1,0 +1,11 @@
+name = "geminilink-app"
+main = "src/index.ts"
+compatibility_date = "2025-11-12"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "geminilink_db"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "geminilink-files"
