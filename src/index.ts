@@ -1,28 +1,31 @@
 /*
  * 檔案: src/index.ts
- * 版本: V15 (D1+R2+AI 最終修正)
+ * 版本: V18 (動態表格 + 手動供應商)
  * 備註: 這是您的核心後端 API 伺服器。
- * - [D1 修正] 新增 "ensureSupplierExists" 邏輯，自動建立不存在的供應商。
- * - [R2 修正] 使用 `await fetchAndUploadImage`，確保圖片上傳成功並正確回報錯誤。
- * - [AI 修正] 使用您確認過的 `gemini-2.5-flash` 模型。
+ * - [API 新增] /api/admin/airtable-tables API，用於抓取 Base 中的所有表格。
+ * - [API 升級] /api/admin/batch-import 現在需要 "table_id" 和 "supplier_id" 兩個參數。
+ * - [API 升級] 匯入邏輯不再猜測供應商，而是使用您傳入的 "supplier_id"。
+ * - [UI 升級] /admin/importer 頁面現在會動態載入「下拉選單」並新增「供應商 ID」輸入框。
  */
 
 import { Hono } from 'hono';
 import { html } from 'hono/html';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { parse } from 'csv-parse/browser/esm/sync';
 import * as bcrypt from 'bcryptjs';
+import Airtable from 'airtable';
 
+// v17: 我們不再需要 AIRTABLE_TABLE_NAME
 export interface Env {
 	DB: D1Database;
 	FILES: R2Bucket;
 	GEMINI_API_KEY: string;
 	REGISTRATION_KEY: string;
+	AIRTABLE_API_KEY: string;
+	AIRTABLE_BASE_ID: string;
 }
 
 // --- 設定 ---
-const BATCH_SIZE = 3; 
-const CSV_FILE_NAME = 'product_inventory_master_v2.csv'; // R2 上的 CSV 檔案
+const BATCH_SIZE = 3; // 每次處理 3 筆
 const BCRYPT_SALT_ROUNDS = 10;
 // -------------
 
@@ -31,7 +34,7 @@ const app = new Hono<{ Bindings: Env }>();
 // ===========================================
 // === 2. API 路由 (v12 保留：認證) ===
 // ===========================================
-
+// (此區塊程式碼與 v17 相同，保持不變)
 app.post('/api/auth/register', async (c) => {
 	const body = await c.req.json();
 	const { email, password, key } = body;
@@ -58,7 +61,6 @@ app.post('/api/auth/register', async (c) => {
 		return c.json({ error: '資料庫錯誤', message: e.message }, 500);
 	}
 });
-
 app.post('/api/auth/login', async (c) => {
 	const body = await c.req.json();
 	const { email, password } = body;
@@ -81,71 +83,112 @@ app.post('/api/auth/login', async (c) => {
 	});
 });
 
+
 // ===========================================
-// === 3. API 路由 (v15 修正：匯入工具) ===
+// === 3. API 路由 (v18 升級：匯入) ===
 // ===========================================
 
+/**
+ * [v18 新增] API 1: 取得 Airtable Base 中的所有表格
+ * 用於填充 UI 上的下拉選單
+ */
+app.get('/api/admin/airtable-tables', async (c) => {
+	const env = c.env;
+	try {
+		// 這是 Airtable 的 Metadata API
+		const url = `https://api.airtable.com/v0/meta/bases/${env.AIRTABLE_BASE_ID}/tables`;
+		const response = await fetch(url, {
+			headers: {
+				Authorization: `Bearer ${env.AIRTABLE_API_KEY}`,
+			},
+		});
+
+		if (!response.ok) {
+			const errText = await response.text();
+			throw new Error(`Airtable Metadata API 錯誤: ${response.status} ${errText}`);
+		}
+
+		const data: any = await response.json();
+		
+		// 我們只需要 id 和 name
+		const tables = data.tables.map((table: any) => ({
+			id: table.id,
+			name: table.name,
+		}));
+
+		return c.json(tables);
+	} catch (e: any) {
+		return c.json({ error: '無法取得 Airtable 表格列表', message: e.message }, 500);
+	}
+});
+
+
+/**
+ * [v18 升級] API 2: 批次匯入
+ * 現在需要 "table_id" 和 "supplier_id"
+ */
 app.get('/api/admin/batch-import', async (c) => {
 	const env = c.env;
 	const url = new URL(c.req.url);
 
 	try {
 		const startTime = Date.now();
+		// 1. 初始化服務
 		const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-		
-        // v15 修正：使用您確認過的 `gemini-2.5-flash`
-		const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' }); 
-
+		const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 		const DB = env.DB;
 		const R2_BUCKET = env.FILES;
-		const batchNumber = parseInt(url.searchParams.get('batch') || '1', 10);
-		const offset = (batchNumber - 1) * BATCH_SIZE;
+		Airtable.configure({ apiKey: env.AIRTABLE_API_KEY });
+		const base = Airtable.base(env.AIRTABLE_BASE_ID);
+		
+		// 2. v18 升級：取得 table_id, offset, 和 supplier_id
+		const offset = url.searchParams.get('offset') || undefined;
+		const tableId = url.searchParams.get('table_id');
+		const supplierId = url.searchParams.get('supplier_id'); // v18 新增
 
-		const csvObject = await R2_BUCKET.get(CSV_FILE_NAME);
-		if (csvObject === null) {
-			return c.json({ error: `R2 儲存桶中找不到檔案: ${CSV_FILE_NAME}` }, 404);
+		if (!tableId || !supplierId) {
+			return c.json({ error: 'Airtable Table ID (table_id) 和 供應商 ID (supplier_id) 都是必要參數' }, 400);
 		}
-		const csvText = await csvObject.text();
-		const allProducts: any[] = parse(csvText, {
-			columns: true,
-			skip_empty_lines: true,
-			bom: true, // v4
-		});
 
-		const totalProducts = allProducts.length;
-		const productsToProcess = allProducts.slice(offset, offset + BATCH_SIZE);
+		// 3. 使用動態 tableId 抓取資料
+		const records = await base(tableId)
+			.select({
+				pageSize: BATCH_SIZE,
+				offset: offset,
+			})
+			.firstPage();
+
+		const productsToProcess = records.map((record) => record.fields);
+		const newOffset = records.offset;
 
 		if (productsToProcess.length === 0) {
 			return c.json({
 				message: '🎉 全部匯入完成！',
 				processed: 0,
 				remaining: 0,
-				totalProducts: totalProducts,
+				nextOffset: null,
 			});
 		}
 
+		// 5. 處理這個批次的 3 筆商品
 		const importLog: string[] = [];
 		let dbStatements: D1PreparedStatement[] = [];
 
 		for (const row of productsToProcess) {
-			const sku = row['商品貨號'];
-            // v14 邏輯：從 CSV 讀取供應商，如果為空才預設為 'WEDO'
-			const supplierId = row['供應商'] || 'WEDO';
+			const sku = row['商品貨號'] as string;
+			
+			// v18 升級：不再猜測供應商，直接使用傳入的 supplierId
 			if (!sku) continue;
 
-			// --- v14 修正：D1 FOREIGN KEY 錯誤 ---
-			// 1. 在處理商品前，先確保供應商存在於 D1
-			// ------------------------------------
+			// 5a. 確保供應商存在
 			try {
-                // 這個函式會檢查 'BokBok' (或 'WEDO') 是否存在，不存在則建立
 				await ensureSupplierExists(DB, supplierId);
 			} catch (supplierError: any) {
 				importLog.push(`🔴 SKU ${sku} 失敗：無法建立供應商 "${supplierId}": ${supplierError.message}`);
-				continue; // 跳過這個商品
+				continue;
 			}
-			// ------------------------------------
 			
-			// 5a. 呼叫 AI
+			// 5b. 呼叫 AI
 			const prompt = getAudiencePrompt_v7(row);
 			let audienceTags: string[] = ['other'];
 			try {
@@ -158,24 +201,22 @@ app.get('/api/admin/batch-import', async (c) => {
 				importLog.push(`SKU ${sku} AI 失敗: ${aiError.message}. 使用預設值 ['other']`);
 			}
 
-			// 5b. 準備 SQL (v11)
-			const productStatements = getProductSqlStatements_v11(row, sku, supplierId, audienceTags, DB);
+			// 5c. 準備 SQL
+			const productStatements = getProductSqlStatements_v16(row, sku, supplierId, audienceTags, DB);
 			dbStatements.push(...productStatements);
 			importLog.push(`SKU ${sku} -> 供應商: [${supplierId}] -> 客群: [${audienceTags.join(', ')}] -> 已準備 D1`);
 
-			// --- v14 修正：R2 圖片上傳 (使用 await) ---
-			// 5c. 處理圖片 (現在會等待上傳完成)
-			// ---------------------------------------
-			const imageUrls = parseImageUrls(row['商品圖檔']);
+			// 5d. 處理圖片
+			const images = (row['商品圖檔'] as any[]) || [];
 			let imageIndex = 0;
-			for (const imageUrl of imageUrls) {
+			for (const image of images) {
+				const imageUrl = image.url;
+				if (!imageUrl) continue;
+
 				const isPrimary = imageIndex === 0 ? 1 : 0;
-				const r2Key = `${supplierId}/${sku}/image-${imageIndex + 1}.jpg`;
+				const r2Key = `${supplierId}/${sku}/image-${imageIndex + 1}.jpg`; 
 				try {
-					// v14 修正：直接 await
 					await fetchAndUploadImage(imageUrl, r2Key, R2_BUCKET);
-			
-					// 只有在上傳成功後，才將 SQL 加入批次
 					dbStatements.push(
 						DB.prepare(`INSERT OR IGNORE INTO ProductImages (sku, r2_key, is_primary) VALUES (?, ?, ?)`).bind(
 							sku,
@@ -184,14 +225,11 @@ app.get('/api/admin/batch-import', async (c) => {
 						),
 					);
 					importLog.push(`  └ 圖片 ${imageIndex + 1} -> 已上傳至 R2: ${r2Key}`);
-			
 				} catch (imgError: any) {
-					// v14 修正：現在可以捕捉到 Airtable 過期網址的錯誤
 					importLog.push(`  └ 🔴 圖片 ${imageIndex + 1} (${imageUrl.substring(0, 30)}...) 處理失敗: ${imgError.message}`);
 				}
 				imageIndex++;
 			}
-			// ---------------------------------------
 		}
 
 		// 6. 執行 D1 批次
@@ -202,16 +240,12 @@ app.get('/api/admin/batch-import', async (c) => {
 		}
 
 		const endTime = Date.now();
-		const nextBatch = batchNumber + 1;
-		const remaining = totalProducts - (offset + productsToProcess.length);
 
 		// 7. 回傳 JSON 報告
 		return c.json({
-			message: `✅ 批次 ${batchNumber} 完成。`,
+			message: `✅ 批次 (Table: ${tableId}, Offset: ${offset || 'start'}) 完成。`,
 			processed: productsToProcess.length,
-			remaining: remaining,
-			totalProducts: totalProducts,
-			nextBatch: remaining > 0 ? nextBatch : null,
+			nextOffset: newOffset || null, 
 			duration: `${(endTime - startTime) / 1000} 秒`,
 			logs: importLog,
 		});
@@ -222,18 +256,19 @@ app.get('/api/admin/batch-import', async (c) => {
 
 /**
  * GET /admin/importer
- * 匯入工具 UI (v13 保留)
+ * 匯入工具 UI (v18 升級)
  */
 app.get('/admin/importer', (c) => {
-	// v15 修正：更新 UI 標題
+	// v18 升級：UI 標題和 JavaScript 邏輯已更新
 	return c.html(html`
 		<!DOCTYPE html>
 		<html lang="zh-Hant">
 			<head>
 				<meta charset="UTF-8" />
 				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-				<title>雙核星鏈 - 即時匯入工具 (v15)</title>
+				<title>雙核星鏈 - Airtable 匯入工具 (v18)</title>
 				<style>
+					/* ... (v17 的 CSS 樣式保持不變) ... */
 					body {
 						font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
 						margin: 0;
@@ -270,6 +305,40 @@ app.get('/admin/importer', (c) => {
 					}
 					button:hover:not(:disabled) {
 						background-color: #0056b3;
+					}
+					/* v18 升級：表單樣式 */
+					#importer-form {
+						display: grid;
+						grid-template-columns: 1fr;
+						gap: 10px;
+						margin-bottom: 1rem;
+						padding: 1rem;
+						background-color: #fafafa;
+						border-radius: 5px;
+					}
+					@media (min-width: 600px) {
+						#importer-form {
+							grid-template-columns: 1fr 1fr auto;
+						}
+					}
+					.form-group {
+						display: flex;
+						flex-direction: column;
+					}
+					.form-group label {
+						font-size: 0.85rem;
+						font-weight: 500;
+						margin-bottom: 4px;
+						color: #555;
+					}
+					.form-group select, .form-group input {
+						font-size: 1rem;
+						padding: 10px;
+						border: 1px solid #ccc;
+						border-radius: 5px;
+					}
+					#start-button {
+						align-self: end; /* 對齊到 grid 的底部 */
 					}
 					#logs {
 						font-family: 'SF Mono', 'Consolas', 'Menlo', monospace;
@@ -310,10 +379,23 @@ app.get('/admin/importer', (c) => {
 			</head>
 			<body>
 				<div id="root">
-					<h1>雙核星鏈 (GeminiLink) - 即時匯入工具 (v15)</h1>
-					<p>點擊按鈕開始將 R2 (geminilink-files) 中的 CSV 檔案匯入 D1 (geminilink_db)。</p>
-					<p>匯入將在您的瀏覽器中自動分批執行，請保持此頁面開啟直到完成。</p>
-					<button id="start-button">開始全自動匯入</button>
+					<h1>雙核星鏈 (GeminiLink) - Airtable 匯入工具 (v18)</h1>
+					<p>系統已自動抓取您 Airtable Base 中的所有表格。請選擇要匯入的表格，並手動指定一個供應商 ID。</p>
+					
+					<!-- v18 升級：改為表單 -->
+					<div id="importer-form">
+						<div class="form-group">
+							<label for="table-select">1. 選擇 Airtable 表格</label>
+							<select id="table-select" disabled>
+								<option value="">載入中...</option>
+							</select>
+						</div>
+						<div class="form-group">
+							<label for="supplier-id-input">2. 指定供應商 ID</label>
+							<input type="text" id="supplier-id-input" placeholder="例如: WEDO (將用於 R2 資料夾)" />
+						</div>
+						<button id="start-button" disabled>載入表格中...</button>
+					</div>
 					
 					<div id="status">狀態：待命中...</div>
 					<div id="logs">
@@ -323,44 +405,98 @@ app.get('/admin/importer', (c) => {
 
 				<script>
 					const startButton = document.getElementById('start-button');
+					const tableSelect = document.getElementById('table-select');
+					const supplierIdInput = document.getElementById('supplier-id-input');
 					const logsContainer = document.getElementById('logs');
 					const statusElement = document.getElementById('status');
-					let totalProducts = 0;
+					let totalProcessed = 0;
 
-					startButton.addEventListener('click', () => {
-						startButton.disabled = true;
-						startButton.textContent = '匯入中...';
-						addLog('初始化...', 'batch-start');
-						runBatch(1); // 從批次 1 開始
+					// v18 升級：頁面載入時，自動抓取表格列表
+					window.addEventListener('load', async () => {
+						try {
+							const response = await fetch('/api/admin/airtable-tables');
+							if (!response.ok) {
+								throw new Error('無法抓取表格列表');
+							}
+							const tables = await response.json();
+							
+							tableSelect.innerHTML = '<option value="">-- 請選擇一個表格 --</option>'; // 清空 "載入中..."
+							tables.forEach(table => {
+								const option = document.createElement('option');
+								option.value = table.id; // "tblRUJ..."
+								option.textContent = table.name; // "WEDO商品"
+								tableSelect.appendChild(option);
+							});
+							tableSelect.disabled = false;
+							startButton.disabled = false;
+							startButton.textContent = '開始全自動匯入';
+
+						} catch (error) {
+							addLog(\`🔴 嚴重錯誤：無法載入 Airtable 表格列表。 \${error.message}\`, 'error');
+							statusElement.textContent = '狀態：初始化失敗。';
+						}
 					});
 
-					async function runBatch(batchNumber) {
-						if (!batchNumber) {
-							addLog('🎉 全部匯入完成！', 'success');
-							statusElement.textContent = \`狀態：全部 \${totalProducts} 筆商品已完成匯入！\`;
+					startButton.addEventListener('click', () => {
+						// v18 升級：從下拉選單和輸入框讀取
+						const tableId = tableSelect.value;
+						const supplierId = supplierIdInput.value;
+
+						if (!tableId) {
+							addLog('錯誤：請從下拉選單選擇一個表格。', 'error');
+							return;
+						}
+						if (!supplierId) {
+							addLog('錯誤：請輸入一個供應商 ID (例如 WEDO)。', 'error');
+							return;
+						}
+
+						startButton.disabled = true;
+						tableSelect.disabled = true;
+						supplierIdInput.disabled = true;
+						startButton.textContent = '匯入中...';
+						addLog(\`初始化... 準備匯入表格: \${tableId} | 供應商: \${supplierId}\`, 'batch-start');
+						totalProcessed = 0;
+						runBatch(tableId, supplierId, null); // v18 升級：傳入 tableId 和 supplierId
+					});
+
+					async function runBatch(tableId, supplierId, offset) {
+						// v18 升級：offset 為 null (最後一頁) 時結束
+						if (offset === 'STOP') {
+							addLog(\`🎉 全部匯入完成！總共處理 \${totalProcessed} 筆商品。\`, 'success');
+							statusElement.textContent = \`狀態：全部 \${totalProcessed} 筆商品已完成匯入！\`;
 							startButton.disabled = false;
+							tableSelect.disabled = false;
+							supplierIdInput.disabled = false;
 							startButton.textContent = '重新開始';
 							return;
 						}
 
-						statusElement.textContent = \`狀態：正在處理批次 \${batchNumber}...\`;
-						addLog(\`--- 開始處理批次 \${batchNumber} --- \`, 'batch-start');
+						const offsetString = offset || 'START';
+						statusElement.textContent = \`狀態：正在處理 (Offset: \${offsetString})...\`;
+						addLog(\`--- 開始處理 (Table: \${tableId}, Supplier: \${supplierId}, Offset: \${offsetString}) --- \`, 'batch-start');
 
 						try {
-							// 呼叫我們自己的 v15 API
-							const response = await fetch(\`/api/admin/batch-import?batch=\${batchNumber}\`);
+							// v18 升級：API 路徑現在包含 table_id, supplier_id, 和 offset
+							const apiUrl = new URL('/api/admin/batch-import', window.location.origin);
+							apiUrl.searchParams.set('table_id', tableId);
+							apiUrl.searchParams.set('supplier_id', supplierId);
+							if (offset) {
+								apiUrl.searchParams.set('offset', offset);
+							}
+
+							const response = await fetch(apiUrl.toString());
+							
 							if (!response.ok) {
 								const errData = await response.json().catch(() => ({}));
 								throw new Error(\`HTTP 錯誤！狀態: \${response.status} - \${errData.message || response.statusText}\`);
 							}
 							
 							const data = await response.json();
-
 							if (data.error) {
 								throw new Error(data.message);
 							}
 							
-							// 顯示 AI 和圖片處理日誌
 							if (data.logs && Array.isArray(data.logs)) {
 								data.logs.forEach(log => {
 									const isError = log.includes('失敗') || log.includes('🔴');
@@ -368,19 +504,21 @@ app.get('/admin/importer', (c) => {
 								});
 							}
 
-							totalProducts = data.totalProducts || totalProducts;
-							const processedCount = (totalProducts - (data.remaining || 0));
-							statusElement.textContent = \`狀態：批次 \${batchNumber} 完成。 (\${processedCount} / \${totalProducts})\`;
+							totalProcessed += data.processed || 0;
+							statusElement.textContent = \`狀態：批次完成。 (已處理 \${totalProcessed} 筆商品)\`;
 							
-							// 遞迴呼叫下一個批次
+							// v18 升級：遞迴呼叫下一個 offset
+							const nextOffset = data.nextOffset || 'STOP'; // 如果 nextOffset 是 null，代表結束
 							setTimeout(() => {
-								runBatch(data.nextBatch);
+								runBatch(tableId, supplierId, nextOffset);
 							}, 500); // 批次之間延遲 0.5 秒
 
 						} catch (error) {
-							addLog(\`批次 \${batchNumber} 失敗: \${error.message}\`, 'error');
-							statusElement.textContent = \`狀態：批次 \${batchNumber} 失敗。請檢查日誌並重試。\`;
+							addLog(\`批次 (Offset: \${offsetString}) 失敗: \${error.message}\`, 'error');
+							statusElement.textContent = \`狀態：批次 (Offset: \${offsetString}) 失敗。請檢查日誌並重試。\`;
 							startButton.disabled = false;
+							tableSelect.disabled = false;
+							supplierIdInput.disabled = false;
 							startButton.textContent = '重試';
 						}
 					}
@@ -402,9 +540,9 @@ app.get('/admin/importer', (c) => {
 });
 
 // ===========================================
-// === 5. 輔助函式 (Helpers) (v14 新增/修改) ===
+// === 5. 輔助函式 (Helpers) (v16 修改) ===
 // ===========================================
-
+// (此區塊程式碼與 v17 相同，保持不變)
 /**
  * v14 新增：確保供應商存在
  */
@@ -425,7 +563,7 @@ async function ensureSupplierExists(db: D1Database, supplierId: string) {
  * AI 提示模板 (v7 規則更新版)
  */
 function getAudiencePrompt_v7(product: any): string {
-	const description = (product['商品介紹'] || '').substring(0, 300);
+	const description = (product['商品介紹'] as string || '').substring(0, 300);
 	return `
 		你是一個資料庫ETL專家。
 		請根據以下商品資料，判斷其主要適用物種 (Audience)。
@@ -453,20 +591,19 @@ function getAudiencePrompt_v7(product: any): string {
 }
 
 /**
- * 輔助函式：解析 '商品圖檔' 欄位中的多個 URL
+ * 輔助函式：解析 '商品圖檔' 欄位
  */
-function parseImageUrls(cellContent: string): string[] {
-	if (!cellContent) return [];
-	const urlRegex = /\((https:\/\/[^)]+)\)/g;
-	const matches = cellContent.matchAll(urlRegex);
-	return Array.from(matches, (match) => match[1]);
+function parseImageUrls(airtableImageField: any): string[] {
+	if (!Array.isArray(airtableImageField)) {
+		return [];
+	}
+	return airtableImageField.map((image: any) => image.url).filter(Boolean);
 }
 
 /**
  * 輔助函式：從 URL 下載圖片並上傳到 R2
  */
 async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket) {
-	// v14 修正：移除內部 try...catch，讓錯誤可以被上層捕捉
 	const response = await fetch(url);
 	if (!response.ok) {
 		throw new Error(`下載失敗: ${response.status} ${response.statusText}`);
@@ -480,10 +617,10 @@ async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket)
 }
 
 /**
- * 輔助函式：準備 D1 商品資料 (v11 版)
+ * 輔助函式：準備 D1 商品資料 (v16 版)
  */
-function getProductSqlStatements_v11(
-	row: any,
+function getProductSqlStatements_v16(
+	row: any, // row 現在是 Airtable record.fields
 	sku: string,
 	supplierId: string,
 	audienceTags: string[],
@@ -491,7 +628,6 @@ function getProductSqlStatements_v11(
 ): D1PreparedStatement[] {
 	const statements: D1PreparedStatement[] = [];
 
-	// 1. 寫入 'Products' 主檔
 	statements.push(
 		db
 			.prepare(
@@ -520,7 +656,6 @@ function getProductSqlStatements_v11(
 			),
 	);
 
-	// 2. 寫入 'ProductInventory' 庫存
 	statements.push(
 		db
 			.prepare(
@@ -529,20 +664,18 @@ function getProductSqlStatements_v11(
 			)
 			.bind(
 				sku,
-				parseInt(row['庫存_正品_可用']) || 0,
-				parseInt(row['庫存_次品_可用']) || 0,
+				0, // v16: 預設為 0
+				0  // v16: 預設為 0
 			),
 	);
 
-	// 3. 寫入 'ProductTags' 標籤
 	if (row['類別']) {
 		statements.push(db.prepare(`INSERT OR IGNORE INTO ProductTags (sku, tag) VALUES (?, ?)`).bind(sku, row['類別']));
 	}
 
-	// 4. 寫入 'ProductAudience' (AI 產生的)
 	for (const tag of audienceTags) {
 		if (tag) {
-			statements.push(db.prepare(`INSERT OR IGNORE INTO ProductAudience (sku, audience_tag) VALUES (?, ?)`).bind(sku, tag));
+			statements.push(db.prepare(`INSERT OR IGGNORE INTO ProductAudience (sku, audience_tag) VALUES (?, ?)`).bind(sku, tag));
 		}
 	}
 
