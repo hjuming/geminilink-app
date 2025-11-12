@@ -1,9 +1,12 @@
 # .github/workflows/deploy-worker.yml
 #
-# v4 最終版：
-# 1. 現在會推送 "兩個" 執行時機密 (GEMINI_API_KEY 和 REGISTRATION_KEY)。
-# 2. 這個 workflow 會在 "push" (推送) 程式碼到 "main" (主) 分支時自動觸發。
-
+# 版本: V6 (bun install 修正)
+# 備註: 
+# - [關鍵修正] 將 "bun install --frozen-lockfile" 
+#   修改為 "bun install"，以強制 bun 讀取 package.json
+#   並安裝新加入的 "airtable" 套件。
+# - 保留了 v5 的所有 Secrets 注入 (Gemini, Registration, Airtable)。
+#
 name: Deploy GeminiLink Worker
 
 on:
@@ -23,26 +26,35 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Install dependencies (安裝依賴套件)
-        run: bun install --frozen-lockfile
+        # v6 修正：移除 --frozen-lockfile
+        run: bun install
 
-      # 
-      # 步驟 A：將 GitHub Secrets 注入到 Cloudflare Secrets (執行時機密)
-      #
+      # --- 步驟 A：注入執行時 (Runtime) 機密 ---
       - name: Set Gemini API Key Secret (設定 Gemini 金鑰)
         run: echo ${{ secrets.GEMINI_API_KEY }} | npx wrangler secret put GEMINI_API_KEY
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      - name: Set Registration Key Secret (設定註冊安全碼)
+      - name: Set Registration Key Secret (設定註冊碼)
         run: echo ${{ secrets.REGISTRATION_KEY }} | npx wrangler secret put REGISTRATION_KEY
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      
+      - name: Set Airtable API Key Secret (設定 Airtable 金鑰)
+        run: echo ${{ secrets.AIRTABLE_API_KEY }} | npx wrangler secret put AIRTABLE_API_KEY
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      #
-      # 步驟 B：部署 Worker 程式碼 (部署時機密)
-      #
+      - name: Set Airtable Base ID Secret (設定 Airtable Base ID)
+        run: echo ${{ secrets.AIRTABLE_BASE_ID }} | npx wrangler secret put AIRTABLE_BASE_ID
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # --- 步驟 B：部署 Worker 程式碼 ---
       - name: Deploy to Cloudflare (部署 Worker)
         run: npx wrangler deploy
         env:
