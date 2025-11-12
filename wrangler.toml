@@ -1,16 +1,19 @@
 name = "geminilink-app"
 main = "src/index.ts"
-compatibility_date = "2025-11-12"
+compatibility_date = "2025-11-12" # 您可以保留您自己的日期
 
-# 綁定資料庫與儲存桶
+# 綁定 D1 資料庫 (geminilink_db)
+# 您的程式碼將可以透過 `env.DB` 來存取
 [[d1_databases]]
 binding = "DB"
 database_name = "geminilink_db"
 
+# 綁定 R2 儲存桶 (geminilink-files)
+# 您的程式碼將可以透過 `env.FILES` 來存取
 [[r2_buckets]]
 binding = "FILES"
 bucket_name = "geminilink-files"
 
-# 設定環境變數
-[vars]
-GEMINI_API_KEY = "你的_Gemini_API_金鑰"
+# 移除 [vars] 區塊
+# 您的 GEMINI_API_KEY 將會作為 "Secret" (機密) 變數
+# 自動注入到 env.GEMINI_API_KEY 中
