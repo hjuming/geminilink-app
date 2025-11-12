@@ -4,7 +4,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { parse } from 'csv-parse/browser/esm/sync';
 
 /**
- * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v3 - 最終版)
+ * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v4 - 最終修正版)
  *
  * 環境變數 (來自 wrangler.toml 和 Cloudflare Secrets):
  * - env.DB: 我們的 D1 資料庫 (geminilink_db)
@@ -13,7 +13,7 @@ import { parse } from 'csv-parse/browser/esm/sync';
  */
 export interface Env {
 	DB: D1Database;
-	FILES: R2Bucket; // 修正：符合 wrangler.toml 的 "FILES" 綁定
+	FILES: R2Bucket; // 修正 v3：符合 wrangler.toml 的 "FILES" 綁定
 	GEMINI_API_KEY: string;
 }
 
@@ -42,7 +42,7 @@ export default {
 			const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
 			const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 			const DB = env.DB;
-			const R2_BUCKET = env.FILES; // 修正：使用 env.FILES
+			const R2_BUCKET = env.FILES; // 修正 v3：使用 env.FILES
 
 			// 2. 取得批次編號 (例如 ?batch=1)
 			const batchNumber = parseInt(url.searchParams.get('batch') || '1', 10);
@@ -59,6 +59,7 @@ export default {
 			const allProducts: any[] = parse(csvText, {
 				columns: true,
 				skip_empty_lines: true,
+				bom: true, // 修正 v4：移除 Excel CSV 的 UTF-8 BOM
 			});
 
 			const totalProducts = allProducts.length;
@@ -95,7 +96,7 @@ export default {
 				}
 
 				// 5b. 準備 SQL 批次 (靜態資料)
-				// 修正：將 DB 實例傳遞給輔助函式
+				// 修正 v3：將 DB 實例傳遞給輔助函式
 				const productStatements = getProductSqlStatements(row, sku, supplierId, audienceTags, DB);
 				dbStatements.push(...productStatements);
 				importLog.push(`SKU ${sku} -> 客群: [${audienceTags.join(', ')}] -> 已準備匯入 D1`);
@@ -130,7 +131,11 @@ export default {
 			} // 商品迴圈結束
 
 			// 6. 執行 D1 批次匯入 (包含所有商品資料 + 圖片資料)
-			await DB.batch(dbStatements);
+			if (dbStatements.length > 0) { // 修正 v4：確保有 SQL 才執行
+				await DB.batch(dbStatements);
+			} else {
+				importLog.push('警告：這個批次沒有產生任何 SQL 語句。');
+			}
 
 			const endTime = Date.now();
 			const nextBatch = batchNumber + 1;
@@ -188,7 +193,7 @@ function parseImageUrls(cellContent: string): string[] {
 }
 
 /**
- * 【新】輔助函式：從 URL 下載圖片並上傳到 R2
+ * 【新】輔D助函式：從 URL 下載圖片並上傳到 R2
  * 這是一個非同步函式，會在背景執行
  */
 async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket) {
@@ -213,7 +218,7 @@ async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket)
 
 /**
  * 輔助函式：準備 D1 商品資料 (不含圖片)
- * 修正：傳入 DB 實例
+ * 修正 v3：傳入 DB 實例
  */
 function getProductSqlStatements(
 	row: any,
