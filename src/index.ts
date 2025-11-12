@@ -1,81 +1,180 @@
+/*
+ * 檔案: src/index.ts
+ * 版本: V12 (Hono 路由 + 認證)
+ * 備註: 這是您的核心後端 API 伺服器。
+ * - 使用 Hono 進行路由管理。
+ * - 新增 /api/auth/register 和 /api/auth/login API。
+ * - 保留 v11 的全自動批次匯入功能。
+ * - 修正了所有 CSV 解析、Gemini 模型名稱 (gemini-2.5-flash) 和 D1 綁定問題。
+ */
+
+import { Hono } from 'hono';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-// 修正 v3：使用 "browser/esm/sync" 路徑
-import { parse } from 'csv-parse/browser/esm/sync';
+import { parse } from 'csv-parse/browser/esm/sync'; // v3 修正版
+import * as bcrypt from 'bcryptjs'; // v12 新增
 
 /**
- * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v11 - 新增英文品名+現貨狀態)
- *
- * 環境變數 (來自 wrangler.toml 和 Cloudflare Secrets):
- * - env.DB: 我們的 D1 資料庫 (geminilink_db)
- * - env.FILES: 我們的 R2 儲存桶 (geminilink-files)
- * - env.GEMINI_API_KEY: 您的 Gemini API 金鑰 (來自 Cloudflare Secrets)
+ * 環境變數 (來自 wrangler.toml 和 Cloudflare Secrets)
  */
 export interface Env {
 	DB: D1Database;
-	FILES: R2Bucket; // 修正 v3：符合 wrangler.toml 的 "FILES" 綁定
+	FILES: R2Bucket;
 	GEMINI_API_KEY: string;
+	REGISTRATION_KEY: string; // v12 新增：用於保護註冊 API
 }
 
 // --- 設定 ---
-const BATCH_SIZE = 3; // 降至 3 筆，因為圖片處理非常耗時
-const CSV_FILE_NAME = 'product_inventory_master_v2.csv'; // 您上傳到 R2 的檔案名稱
-// -------------
+const BATCH_SIZE = 3; // 每個批次處理 3 筆 (因為圖片處理耗時)
+const CSV_FILE_NAME = 'product_inventory_master_v2.csv'; // R2 上的 CSV 檔案
+const BCRYPT_SALT_ROUNDS = 10; // 密碼加密強度
 
-export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const url = new URL(request.url);
+// ===========================================
+// === 1. 初始化 Hono App (您的 API 路由器) ===
+// ===========================================
+const app = new Hono<{ Bindings: Env }>();
 
-		// --- 路由 1：啟動器 (GET) ---
-		// 這是您唯一需要手動呼叫的網址
-		if (url.pathname === '/admin/start-full-import' && request.method === 'GET') {
-			try {
-				// 立即回傳訊息給使用者，告知任務已開始
-				// 並在背景 (ctx.waitUntil) 觸發第一個批次
-				ctx.waitUntil(
-					// 我們呼叫自己的 POST 處理器，從批次 1 開始
-					fetch(new URL('/admin/process-batch?batch=1', request.url), {
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-					}),
-				);
-
-				// 立即回傳給您
-				return Response.json(
-					{
-						message: '✅ 自動匯入已啟動！ (v11)',
-						details: '系統正在背景處理所有批次。您可以關閉此頁面。',
-						check_r2: '請前往 R2 儀表板 (geminilink-files) 檢查圖片是否陸續上傳。',
-						check_d1: '請前往 D1 儀表板 (geminilink_db) 檢查資料是否陸續寫入。',
-					},
-					{ status: 202 }, // 202 Accepted: 請求已接受，正在處理
-				);
-			} catch (e: any) {
-				return Response.json({ error: '啟動失敗', message: e.message }, { status: 500 });
-			}
-		}
-
-		// --- 路由 2：處理器 (POST) ---
-		// 這個 API 會被「啟動器」或「它自己」在背景呼叫
-		if (url.pathname === '/admin/process-batch' && request.method === 'POST') {
-			// 執行批次匯入邏輯 (在背景執行)
-			// 我們將這個耗時的任務交給 ctx.waitUntil，
-			// 這樣即使呼叫端斷線，它也能繼續執行
-			ctx.waitUntil(handleBatchImport(request, env, ctx));
-
-			// 立即回傳，表示「已收到處理請求」
-			return Response.json({ message: '批次處理請求已接收' }, { status: 202 });
-		}
-
-		// --- 預設 404 ---
-		return new Response(
-			'歡迎使用 雙核星鏈 (GeminiLink) API。\n請訪問 /admin/start-full-import 來啟動匯入。',
-			{ status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
-		);
-	},
-};
+// ===========================================
+// === 2. API 路由 (v12 新增：認證) ===
+// ===========================================
 
 /**
- * 核心處理函式 (v10)
+ * POST /api/auth/register
+ * 註冊您的第一個 admin 帳號。
+ * 需要正確的 REGISTRATION_KEY 才能成功。
+ */
+app.post('/api/auth/register', async (c) => {
+	const body = await c.req.json();
+	const { email, password, key } = body;
+
+	if (!email || !password || !key) {
+		return c.json({ error: '缺少 email, password, 或 key' }, 400);
+	}
+
+	// 驗證 Registration Key
+	if (key !== c.env.REGISTRATION_KEY) {
+		return c.json({ error: '無效的註冊安全碼' }, 403); // 403 Forbidden
+	}
+
+	// 檢查帳號是否已存在
+	try {
+		const existingUser = await c.env.DB.prepare('SELECT user_id FROM Users WHERE email = ?').bind(email).first();
+		if (existingUser) {
+			return c.json({ error: '此 email 已被註冊' }, 409); // 409 Conflict
+		}
+
+		// 將密碼加密
+		const passwordHash = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+
+		// 寫入 D1 資料庫 (建立為 admin)
+		await c.env.DB.prepare(
+			`INSERT INTO Users (email, password_hash, role, supplier_id) 
+       VALUES (?, ?, 'admin', NULL)`, // Admin 帳號不綁定特定供應商
+		).bind(email, passwordHash).run();
+
+		return c.json({ message: 'Admin 帳號建立成功' });
+	} catch (e: any) {
+		return c.json({ error: '資料庫錯誤', message: e.message }, 500);
+	}
+});
+
+/**
+ * POST /api/auth/login
+ * 登入以取得權限 (未來用於前端介面)
+ * (注意：一個完整的系統會回傳 JWT (Token)，目前我們先回傳成功訊息)
+ */
+app.post('/api/auth/login', async (c) => {
+	const body = await c.req.json();
+	const { email, password } = body;
+
+	if (!email || !password) {
+		return c.json({ error: '缺少 email 或 password' }, 400);
+	}
+
+	// 1. 尋找使用者
+	const user = await c.env.DB.prepare(
+    'SELECT user_id, email, password_hash, role FROM Users WHERE email = ?'
+  ).bind(email).first<{ user_id: number; email: string; password_hash: string; role: string }>();
+
+	if (!user) {
+		return c.json({ error: '帳號或密碼錯誤' }, 401); // 401 Unauthorized
+	}
+
+	// 2. 驗證密碼
+	const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+
+	if (!isPasswordValid) {
+		return c.json({ error: '帳號或密碼錯誤' }, 401);
+	}
+
+	// 登入成功
+	// (未來：在這裡產生一個 JWT Token)
+	return c.json({
+		message: '登入成功',
+		user: {
+			userId: user.user_id,
+			email: user.email,
+			role: user.role,
+		},
+		// token: "your-future-jwt-token-here"
+	});
+});
+
+
+// ===========================================
+// === 3. API 路由 (v11 保留：全自動匯入) ===
+// ===========================================
+
+/**
+ * GET /admin/start-full-import
+ * 啟動器：您唯一需要手動呼叫的網址
+ */
+app.get('/admin/start-full-import', (c) => {
+	try {
+		// 立即回傳訊息給使用者，告知任務已開始
+		// 並在背景 (c.executionCtx.waitUntil) 觸發第一個批次
+		c.executionCtx.waitUntil(
+			// 我們呼叫自己的 POST 處理器，從批次 1 開始
+			fetch(new URL('/admin/process-batch?batch=1', c.req.url), {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+			}),
+		);
+
+		// 立即回傳給您
+		return c.json(
+			{
+				message: '✅ 自動匯入已啟動！ (v12)',
+				details: '系統正在背景處理所有批次。您可以關閉此頁面。',
+				check_r2: '請前往 R2 儀表板 (geminilink-files) 檢查圖片是否陸續上傳。',
+				check_d1: '請前往 D1 儀表板 (geminilink_db) 檢查資料是否陸續寫入。',
+			},
+			202, // 202 Accepted: 請求已接受，正在處理
+		);
+	} catch (e: any) {
+		return c.json({ error: '啟動失敗', message: e.message }, 500);
+	}
+});
+
+/**
+ * POST /admin/process-batch
+ * 處理器：這個 API 會被「啟動器」或「它自己」在背景呼叫
+ */
+app.post('/admin/process-batch', async (c) => {
+	// 執行批次匯入邏輯 (在背景執行)
+	// 我們將這個耗時的任務交給 c.executionCtx.waitUntil，
+	// 這樣即使呼叫端斷線，它也能繼續執行
+	c.executionCtx.waitUntil(handleBatchImport(c.req, c.env, c.executionCtx));
+
+	// 立即回傳，表示「已收到處理請求」
+	return c.json({ message: '批次處理請求已接收' }, 202);
+});
+
+// ===========================================
+// === 4. 核心匯入邏輯 (來自 v11) ===
+// ===========================================
+
+/**
+ * 核心處理函式 (v11)
  * 這會在背景執行 (由 ctx.waitUntil 觸發)
  */
 async function handleBatchImport(request: Request, env: Env, ctx: ExecutionContext) {
@@ -87,7 +186,7 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 
 		// 1. 初始化服務 (從 env 取得)
 		const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-		// *** 修正 v9：使用您指定的 'gemini-2.5-flash' 模型 ***
+		// v9 修正：使用您指定的 'gemini-2.5-flash' 模型
 		const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 		const DB = env.DB;
 		const R2_BUCKET = env.FILES;
@@ -108,7 +207,7 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 		const allProducts: any[] = parse(csvText, {
 			columns: true,
 			skip_empty_lines: true,
-			bom: true, // 修正 v4：移除 Excel CSV 的 UTF-8 BOM
+			bom: true, // v4 修正：移除 Excel CSV 的 UTF-8 BOM
 		});
 
 		const totalProducts = allProducts.length;
@@ -144,7 +243,7 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 			}
 
 			// 5b. 準備 SQL 批次 (靜態資料)
-			// *** v11：呼叫更新的 getProductSqlStatements_v11 ***
+			// v11：呼叫更新的 getProductSqlStatements_v11
 			const productStatements = getProductSqlStatements_v11(row, sku, supplierId, audienceTags, DB);
 			dbStatements.push(...productStatements);
 			importLog.push(`SKU ${sku} -> 客群: [${audienceTags.join(', ')}] -> 已準備匯入 D1`);
@@ -196,6 +295,8 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 			
 			// 構造下一個批次的 URL
 			const nextUrl = new URL(request.url);
+      // 確保我們呼叫的是絕對路徑
+      nextUrl.pathname = '/admin/process-batch';
 			nextUrl.searchParams.set('batch', nextBatch.toString());
 			
 			// 在背景中呼叫自己
@@ -214,6 +315,10 @@ async function handleBatchImport(request: Request, env: Env, ctx: ExecutionConte
 	}
 }
 
+
+// ===========================================
+// === 5. 輔助函式 (Helpers) ===
+// ===========================================
 
 /**
  * AI 提示模板 (v7 規則更新版)
@@ -247,7 +352,7 @@ function getAudiencePrompt_v7(product: any): string {
 }
 
 /**
- * 【新】輔助函式：解析 '商品圖檔' 欄位中的多個 URL
+ * 輔助函式：解析 '商品圖檔' 欄位中的多個 URL
  */
 function parseImageUrls(cellContent: string): string[] {
 	if (!cellContent) return [];
@@ -257,7 +362,7 @@ function parseImageUrls(cellContent: string): string[] {
 }
 
 /**
- * 【新】輔助函式：從 URL 下載圖片並上傳到 R2
+ * 輔助函式：從 URL 下載圖片並上傳到 R2
  */
 async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket) {
 	try {
@@ -276,10 +381,9 @@ async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket)
 }
 
 /**
- * 輔助函式：準備 D1 商品資料 (不含圖片)
- * *** v11 版：新增 name_en 和 is_active_product ***
+ * 輔助函式：準備 D1 商品資料 (v11 版)
  */
-function getProductSqlStatements_v11( // <-- v11
+function getProductSqlStatements_v11(
 	row: any,
 	sku: string,
 	supplierId: string,
@@ -297,13 +401,13 @@ function getProductSqlStatements_v11( // <-- v11
 					description, ingredients, size_dimensions, weight_g, 
 					origin, msrp, case_pack, is_public, is_active_product
 				) 
-			 	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)` // <-- 欄位已更新
+			 	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)` // 欄位已更新
 			)
 			.bind(
 				sku,
 				supplierId,
 				row['產品名稱'] || '',
-				row['英文品名'] || '', // <-- 【新】英文品名
+				row['英文品名'] || '', // 【新】英文品名
 				row['國際條碼'] || null,
 				row['品牌名稱'] || '',
 				row['商品介紹'] || '',
@@ -313,7 +417,7 @@ function getProductSqlStatements_v11( // <-- v11
 				row['產地'] || '',
 				parseInt(String(row['建議售價']).replace('$', '')) || 0,
 				row['箱入數'] || '',
-				row['現貨商品'] === '是' ? 1 : 0 // <-- 【新】現貨商品 (1=是, 0=否)
+				row['現貨商品'] === '是' ? 1 : 0 // 【新】現貨商品 (1=是, 0=否)
 			),
 	);
 
@@ -345,3 +449,8 @@ function getProductSqlStatements_v11( // <-- v11
 
 	return statements;
 }
+
+// ===========================================
+// === 6. Hono 最終啟動點 ===
+// ===========================================
+export default app;
