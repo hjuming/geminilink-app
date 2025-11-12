@@ -1,10 +1,9 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 // 修正 v3：使用 "browser/esm/sync" 路徑
-// 這才是官方提供給 Worker/瀏覽器環境的正確版本
 import { parse } from 'csv-parse/browser/esm/sync';
 
 /**
- * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v4 - 最終修正版)
+ * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v5 - 模型修正版)
  *
  * 環境變數 (來自 wrangler.toml 和 Cloudflare Secrets):
  * - env.DB: 我們的 D1 資料庫 (geminilink_db)
@@ -40,8 +39,13 @@ export default {
 
 			// 1. 初始化服務 (從 env 取得)
 			const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-			const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-			const DB = env.DB;
+			
+            // 修正 v5：切換到 'gemini-pro' 模型
+            // 'gemini-1.5-flash' 似乎在您的專案中不可用 (404 Not Found)
+            // 'gemini-pro' 是最穩定且通用的模型
+			const model = genAI.getGenerativeModel({ model: 'gemini-pro' }); 
+			
+            const DB = env.DB;
 			const R2_BUCKET = env.FILES; // 修正 v3：使用 env.FILES
 
 			// 2. 取得批次編號 (例如 ?batch=1)
@@ -88,7 +92,8 @@ export default {
 				try {
 					const result = await model.generateContent(prompt);
 					const response = result.response.text().trim();
-					const cleanedResponse = response.replace(/```json/g, '').replace(/```/g, '');
+                    // gemini-pro 的回應可能不包含 ```json
+					const cleanedResponse = response.replace(/```json/g, '').replace(/```/g, '').trim();
 					const parsedResponse = JSON.parse(cleanedResponse);
 					audienceTags = Array.isArray(parsedResponse) ? parsedResponse.filter(Boolean) : ['其他'];
 				} catch (aiError: any) {
@@ -106,12 +111,10 @@ export default {
 				let imageIndex = 0;
 				for (const imageUrl of imageUrls) {
 					const isPrimary = imageIndex === 0 ? 1 : 0;
-					// 檔名: image-1.jpg, image-2.jpg ... (Airtable 網址沒有副檔名, 我們預設為 .jpg)
 					const r2Key = `${supplierId}/${sku}/image-${imageIndex + 1}.jpg`;
 
 					try {
 						// 執行下載和上傳 (非同步，但不 block 迴圈)
-						// ctx.waitUntil 在背景執行，確保 Worker 不會提早終止
 						ctx.waitUntil(fetchAndUploadImage(imageUrl, r2Key, R2_BUCKET));
 
 						// 成功後，準備 SQL 寫入 ProductImages
@@ -193,7 +196,7 @@ function parseImageUrls(cellContent: string): string[] {
 }
 
 /**
- * 【新】輔D助函式：從 URL 下載圖片並上傳到 R2
+ * 【新】輔助函式：從 URL 下載圖片並上傳到 R2
  * 這是一個非同步函式，會在背景執行
  */
 async function fetchAndUploadImage(url: string, r2Key: string, bucket: R2Bucket) {
