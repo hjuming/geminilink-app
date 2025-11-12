@@ -1,13 +1,20 @@
+#
+# 檔案: wrangler.toml
+# 版本: V2 (修正版)
+# 備註: - 移除了不安全的 [vars] 區塊。
+#      - 確保 database_id 已填入。
+#      - 綁定了 D1 (DB) 和 R2 (FILES)。
+#
 name = "geminilink-app"
 main = "src/index.ts"
-compatibility_date = "2025-11-12" # 您可以保留您自己的日期
+compatibility_date = "2025-11-12"
 
 # 綁定 D1 資料庫 (geminilink_db)
 # 您的程式碼將可以透過 `env.DB` 來存取
 [[d1_databases]]
 binding = "DB"
 database_name = "geminilink_db"
-database_id = "07c62404-613b-48ce-af4b-88bb5c596110" # <-- ID 已更新
+database_id = "07c62404-613b-48ce-af4b-88bb5c596110"
 
 # 綁定 R2 儲存桶 (geminilink-files)
 # 您的程式碼將可以透過 `env.FILES` 來存取
@@ -15,6 +22,6 @@ database_id = "07c62404-613b-48ce-af4b-88bb5c596110" # <-- ID 已更新
 binding = "FILES"
 bucket_name = "geminilink-files"
 
-# 您的 GEMINI_API_KEY 將作為 "Secret" (機密) 變數
-# 從 Cloudflare 儀表板 (Settings > Environment Variables > Secrets)
-# 自動注入到 env.GEMINI_API_KEY 中
+# 您的 GEMINI_API_KEY 和 REGISTRATION_KEY 將作為 "Secret" (機密) 變數
+# 透過 .github/workflows/deploy-worker.yml V4 
+# 從 GitHub Secrets 自動注入到 Cloudflare Secrets 中
