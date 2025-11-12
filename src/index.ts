@@ -1,5 +1,5 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { parse } from 'csv-parse/sync';
+import { parse } from 'csv-parse/sync/esm';
 
 /**
  * 歡迎使用 雙核星鏈 (GeminiLink) API 伺服器 (v2 - 含圖片處理)
