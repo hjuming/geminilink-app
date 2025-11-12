@@ -1,5 +1,4 @@
 name: Generate Lockfile
-
 on:
   workflow_dispatch:
 
@@ -12,8 +11,15 @@ jobs:
         with:
           node-version: 22
       - run: npm install
-      - run: git config --global user.name "GitHub Actions"
-      - run: git config --global user.email "actions@github.com"
-      - run: git add package-lock.json
-      - run: git commit -m "Auto-update package-lock.json"
-      - run: git push
+
+      - name: Commit lockfile if changed
+        run: |
+          if git diff --quiet -- package-lock.json; then
+            echo "No changes in package-lock.json"
+          else
+            git config --global user.name "GitHub Actions"
+            git config --global user.email "actions@github.com"
+            git add package-lock.json
+            git commit -m "Auto-update package-lock.json"
+            git push
+          fi
